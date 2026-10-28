@@ -1,368 +1,141 @@
 using System;
-using System.Collections.Generic;
-using System.Collections.Immutable;
+using System.IO;
 using System.Linq;
+using System.Collections.Generic;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace ValueFlowAnalyzer;
 
-#region Abstract Domain & Value Representations
-
-public abstract record SymbolicValue
-{
-    public sealed record Constant(object? Value) : SymbolicValue
-    {
-        public override string ToString() => Value is string s ? $"\"{s}\"" : Value?.ToString() ?? "null";
-    }
-
-    public sealed record Range(long Min, long Max) : SymbolicValue
-    {
-        public override string ToString() => Min == Max ? $"{Min}" : $"[{Min} .. {Max}]";
-    }
-
-    public sealed record UnknownInput(string OriginName, string Reason) : SymbolicValue
-    {
-        public override string ToString() => $"<ExternalInput: {OriginName} ({Reason})>";
-    }
-
-    public sealed record SymbolicExpression(string Op, ImmutableList<SymbolicValue> Operands) : SymbolicValue
-    {
-        public override string ToString() => $"{Op}({string.Join(", ", Operands)})";
-    }
-}
-
-public record VariableState
-{
-    public ImmutableHashSet<SymbolicValue> PossibleValues { get; init; } = ImmutableHashSet<SymbolicValue>.Empty;
-
-    public static VariableState Empty => new();
-
-    public static VariableState Single(SymbolicValue value) => 
-        new() { PossibleValues = ImmutableHashSet.Create(value) };
-
-    public VariableState Union(VariableState other) => 
-        new() { PossibleValues = PossibleValues.Union(other.PossibleValues) };
-
-    public override string ToString() => 
-        PossibleValues.Count == 0 ? "∅ (Unassigned)" : string.Join(", ", PossibleValues.OrderBy(v => v.ToString()));
-}
-
-#endregion
-
-#region Static Analysis Engine
-
-public class IntraproceduralValueTracker
-{
-    private readonly Compilation _compilation;
-    private readonly HashSet<IMethodSymbol> _callStack = new(SymbolEqualityComparer.Default);
-
-    public IntraproceduralValueTracker(Compilation compilation)
-    {
-        _compilation = compilation;
-    }
-
-    public VariableState EvaluateVariableAt(SyntaxTree tree, string variableName, int lineNumber)
-    {
-        var root = tree.GetCompilationUnitRoot();
-        var model = _compilation.GetSemanticModel(tree);
-
-        var text = tree.GetText();
-        var line = text.Lines[lineNumber - 1];
-
-        // Find the statement on or immediately preceding this line
-        var targetStatement = root.DescendantNodes()
-            .OfType<StatementSyntax>()
-            .Where(s => text.Lines.GetLinePosition(s.SpanStart).Line <= lineNumber - 1)
-            .OrderByDescending(s => s.SpanStart)
-            .FirstOrDefault();
-
-        if (targetStatement == null)
-            return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Statement not found"));
-
-        var containingMethod = targetStatement.AncestorsAndSelf().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
-        if (containingMethod == null)
-            return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Outside method scope"));
-
-        var flowState = AnalyzeMethod(containingMethod, model, targetStatement);
-
-        return flowState.TryGetValue(variableName, out var state) 
-            ? state 
-            : VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Unresolved / out of scope"));
-    }
-
-    private Dictionary<string, VariableState> AnalyzeMethod(
-        BaseMethodDeclarationSyntax method, 
-        SemanticModel model, 
-        SyntaxNode? targetNode = null)
-    {
-        var state = new Dictionary<string, VariableState>
-        {
-            ["$return"] = VariableState.Empty
-        };
-
-        if (method.ParameterList != null)
-        {
-            foreach (var param in method.ParameterList.Parameters)
-            {
-                var paramName = param.Identifier.Text;
-                state[paramName] = VariableState.Single(new SymbolicValue.UnknownInput(paramName, "Method Parameter"));
-            }
-        }
-
-        if (method.Body != null)
-        {
-            AnalyzeBlock(method.Body, state, model, targetNode);
-        }
-        else if (method.ExpressionBody != null)
-        {
-            state["$return"] = EvaluateExpression(method.ExpressionBody.Expression, state, model);
-        }
-
-        return state;
-    }
-
-    private bool AnalyzeBlock(
-        BlockSyntax block, 
-        Dictionary<string, VariableState> state, 
-        SemanticModel model, 
-        SyntaxNode? targetNode)
-    {
-        foreach (var statement in block.Statements)
-        {
-            bool reachedTarget = targetNode != null && statement == targetNode;
-
-            AnalyzeStatement(statement, state, model, targetNode);
-
-            if (reachedTarget)
-                return true;
-
-            // If an unconditional return was hit in this path, stop executing statements in this block
-            if (state.ContainsKey("$terminated"))
-                break;
-        }
-        return false;
-    }
-
-    private void AnalyzeStatement(
-        StatementSyntax stmt, 
-        Dictionary<string, VariableState> state, 
-        SemanticModel model, 
-        SyntaxNode? targetNode)
-    {
-        switch (stmt)
-        {
-            case LocalDeclarationStatementSyntax decl:
-                foreach (var variable in decl.Declaration.Variables)
-                {
-                    var varName = variable.Identifier.Text;
-                    state[varName] = variable.Initializer != null 
-                        ? EvaluateExpression(variable.Initializer.Value, state, model) 
-                        : VariableState.Single(new SymbolicValue.Constant(0));
-                }
-                break;
-
-            case ExpressionStatementSyntax exprStmt when exprStmt.Expression is AssignmentExpressionSyntax assign:
-                state[assign.Left.ToString()] = EvaluateExpression(assign.Right, state, model);
-                break;
-
-            case ReturnStatementSyntax ret when ret.Expression != null:
-                var retVal = EvaluateExpression(ret.Expression, state, model);
-                state["$return"] = state["$return"].Union(retVal);
-                state["$terminated"] = VariableState.Empty;
-                break;
-
-            case IfStatementSyntax ifStmt:
-                var trueState = new Dictionary<string, VariableState>(state);
-                var falseState = new Dictionary<string, VariableState>(state);
-
-                if (ifStmt.Statement is BlockSyntax trueBlock)
-                    AnalyzeBlock(trueBlock, trueState, model, targetNode);
-                else
-                    AnalyzeStatement(ifStmt.Statement, trueState, model, targetNode);
-
-                if (ifStmt.Else != null)
-                {
-                    if (ifStmt.Else.Statement is BlockSyntax elseBlock)
-                        AnalyzeBlock(elseBlock, falseState, model, targetNode);
-                    else
-                        AnalyzeStatement(ifStmt.Else.Statement, falseState, model, targetNode);
-                }
-
-                // If one branch terminated with return and the other didn't, clear $terminated on join
-                bool bothTerminated = trueState.ContainsKey("$terminated") && falseState.ContainsKey("$terminated");
-
-                // Merge variables across both branches
-                var allKeys = trueState.Keys.Union(falseState.Keys).Where(k => k != "$terminated").ToList();
-                foreach (var key in allKeys)
-                {
-                    trueState.TryGetValue(key, out var tVal);
-                    falseState.TryGetValue(key, out var fVal);
-
-                    tVal ??= VariableState.Empty;
-                    fVal ??= VariableState.Empty;
-
-                    state[key] = tVal.Union(fVal);
-                }
-
-                if (bothTerminated)
-                    state["$terminated"] = VariableState.Empty;
-                else
-                    state.Remove("$terminated");
-
-                break;
-        }
-    }
-
-    private VariableState EvaluateExpression(
-        ExpressionSyntax expr, 
-        Dictionary<string, VariableState> env, 
-        SemanticModel model)
-    {
-        switch (expr)
-        {
-            case LiteralExpressionSyntax lit:
-                return VariableState.Single(new SymbolicValue.Constant(lit.Token.Value));
-
-            case IdentifierNameSyntax id:
-                var name = id.Identifier.Text;
-                return env.TryGetValue(name, out var val) 
-                    ? val 
-                    : VariableState.Single(new SymbolicValue.UnknownInput(name, "Unbound identifier"));
-
-            case BinaryExpressionSyntax bin:
-                var leftVals = EvaluateExpression(bin.Left, env, model);
-                var rightVals = EvaluateExpression(bin.Right, env, model);
-                return ComputeBinaryOp(bin.OperatorToken.Text, leftVals, rightVals);
-
-            case InvocationExpressionSyntax inv:
-                return ResolveInvocation(inv, env, model);
-
-            default:
-                return VariableState.Single(new SymbolicValue.UnknownInput(expr.ToString(), "Expression"));
-        }
-    }
-
-    private VariableState ResolveInvocation(
-        InvocationExpressionSyntax inv, 
-        Dictionary<string, VariableState> env, 
-        SemanticModel model)
-    {
-        var symbolInfo = model.GetSymbolInfo(inv);
-        if (symbolInfo.Symbol is not IMethodSymbol methodSymbol)
-        {
-            return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Unresolvable invocation"));
-        }
-
-        var syntaxRef = methodSymbol.DeclaringSyntaxReferences.FirstOrDefault();
-        if (syntaxRef == null || _callStack.Contains(methodSymbol))
-        {
-            return VariableState.Single(new SymbolicValue.UnknownInput(
-                $"{methodSymbol.ContainingType.Name}.{methodSymbol.Name}()", 
-                syntaxRef == null ? "External Library" : "Recursion Boundary"));
-        }
-
-        if (syntaxRef.GetSyntax() is BaseMethodDeclarationSyntax calleeDeclaration)
-        {
-            _callStack.Add(methodSymbol);
-            var calleeModel = _compilation.GetSemanticModel(calleeDeclaration.SyntaxTree);
-
-            var calleeResult = AnalyzeMethod(calleeDeclaration, calleeModel);
-            _callStack.Remove(methodSymbol);
-
-            if (calleeResult.TryGetValue("$return", out var retState) && retState.PossibleValues.Count > 0)
-                return retState;
-        }
-
-        return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
-    }
-
-    private VariableState ComputeBinaryOp(string op, VariableState left, VariableState right)
-    {
-        var results = ImmutableHashSet.CreateBuilder<SymbolicValue>();
-
-        foreach (var l in left.PossibleValues)
-        {
-            foreach (var r in right.PossibleValues)
-            {
-                if (l is SymbolicValue.Constant { Value: int lInt } && r is SymbolicValue.Constant { Value: int rInt })
-                {
-                    results.Add(op switch
-                    {
-                        "+" => new SymbolicValue.Constant(lInt + rInt),
-                        "-" => new SymbolicValue.Constant(lInt - rInt),
-                        "*" => new SymbolicValue.Constant(lInt * rInt),
-                        "/" when rInt != 0 => new SymbolicValue.Constant(lInt / rInt),
-                        _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
-                    });
-                }
-                else
-                {
-                    results.Add(new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r)));
-                }
-            }
-        }
-
-        return new VariableState { PossibleValues = results.ToImmutable() };
-    }
-}
-
-#endregion
-
-#region Driver
-
 public static class Program
 {
-    public static void Main()
+    public static void Main(string[] args)
     {
-        var testCode = """
-        using System;
+        // Example CLI: 
+        // dotnet run -- <source-directory> [relative-file-path] [line-number] [variable-name]
+        string sourceDirectory = args.Length > 0 ? args[0] : @"./MyProjectSource";
 
-        public class OrderProcessor
+        if (!Directory.Exists(sourceDirectory))
         {
-            public int CalculateDiscount(int customerTier, bool isHoliday)
-            {
-                int discountPercent = 0;
-
-                if (isHoliday)
-                {
-                    discountPercent = 15;
-                }
-                else
-                {
-                    discountPercent = ComputeBaseRate(customerTier);
-                }
-
-                int finalRate = discountPercent + 5;
-                return finalRate; // Line 21
-            }
-
-            private int ComputeBaseRate(int tier)
-            {
-                if (tier == 1)
-                {
-                    return 5;
-                }
-                return 10;
-            }
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: Directory not found: {sourceDirectory}");
+            Console.ResetColor();
+            return;
         }
-        """;
 
-        var syntaxTree = CSharpSyntaxTree.ParseText(testCode);
-        var mscorlib = MetadataReference.CreateFromFile(typeof(object).Assembly.Location);
-        var compilation = CSharpCompilation.Create("AnalysisScope", new[] { syntaxTree }, new[] { mscorlib });
+        Console.WriteLine($"[+] Scanning directory: {Path.GetFullPath(sourceDirectory)}");
+
+        // 1. Collect all C# files recursively, ignoring build output
+        var csFiles = Directory.EnumerateFiles(sourceDirectory, "*.cs", SearchOption.AllDirectories)
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}") &&
+                           !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") &&
+                           !path.Contains($"{Path.DirectorySeparatorChar}.git{Path.DirectorySeparatorChar}"))
+            .ToList();
+
+        if (csFiles.Count == 0)
+        {
+            Console.WriteLine("No .cs files found to analyze.");
+            return;
+        }
+
+        Console.WriteLine($"[+] Found {csFiles.Count} source file(s). Parsing syntax trees...");
+
+        // 2. Parse all files into SyntaxTrees with persistent file paths
+        var parseOptions = new CSharpParseOptions(LanguageVersion.Latest);
+        var syntaxTrees = csFiles.Select(file =>
+        {
+            var code = File.ReadAllText(file);
+            return CSharpSyntaxTree.ParseText(code, parseOptions, path: Path.GetFullPath(file));
+        }).ToList();
+
+        // 3. Collect Runtime Metadata References from the running host
+        var metadataReferences = GetRuntimeMetadataReferences();
+
+        // 4. Create single unified Compilation containing all files
+        var compilation = CSharpCompilation.Create(
+            assemblyName: "BatchSourceAnalysis",
+            syntaxTrees: syntaxTrees,
+            references: metadataReferences,
+            options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+        );
 
         var analyzer = new IntraproceduralValueTracker(compilation);
 
-        Console.WriteLine("discountPercent at line 20:");
-        var discountValues = analyzer.EvaluateVariableAt(syntaxTree, "discountPercent", 20);
-        Console.WriteLine($" -> {discountValues}");
+        // MODE A: Targeted query via CLI args
+        if (args.Length >= 4)
+        {
+            string targetRelFile = args[1];
+            int lineNumber = int.Parse(args[2]);
+            string varName = args[3];
 
-        Console.WriteLine("\nfinalRate at line 21:");
-        var finalRateValues = analyzer.EvaluateVariableAt(syntaxTree, "finalRate", 21);
-        Console.WriteLine($" -> {finalRateValues}");
+            var targetTree = syntaxTrees.FirstOrDefault(t => 
+                t.FilePath.EndsWith(targetRelFile, StringComparison.OrdinalIgnoreCase));
+
+            if (targetTree == null)
+            {
+                Console.WriteLine($"Could not locate file matching '{targetRelFile}'");
+                return;
+            }
+
+            Console.WriteLine($"\n[>] Querying '{varName}' in {Path.GetFileName(targetTree.FilePath)} at line {lineNumber}:");
+            var result = analyzer.EvaluateVariableAt(targetTree, varName, lineNumber);
+            Console.WriteLine($"Possible values: {result}\n");
+            return;
+        }
+
+        // MODE B: Scan & evaluate all local declarations in all discovered files
+        Console.WriteLine("\n=== Batch Evaluating Local Variables Across Codebase ===");
+        foreach (var tree in syntaxTrees)
+        {
+            var root = tree.GetCompilationUnitRoot();
+            var text = tree.GetText();
+            var localDecls = root.DescendantNodes().OfType<LocalDeclarationStatementSyntax>().ToList();
+
+            if (localDecls.Count == 0) continue;
+
+            string relPath = Path.GetRelativePath(sourceDirectory, tree.FilePath);
+            Console.WriteLine($"\nFile: {relPath}");
+
+            foreach (var decl in localDecls)
+            {
+                int line = text.Lines.GetLinePosition(decl.SpanStart).Line + 1;
+                foreach (var v in decl.Declaration.Variables)
+                {
+                    string name = v.Identifier.Text;
+                    var result = analyzer.EvaluateVariableAt(tree, name, line);
+                    Console.WriteLine($"  Line {line,4} | {name,-18} => {result}");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Loads runtime metadata references so BCL types (System, Linq, etc.) resolve.
+    /// </summary>
+    private static List<MetadataReference> GetRuntimeMetadataReferences()
+    {
+        var references = new List<MetadataReference>();
+
+        // Resolves all trusted platform assemblies loaded by the current .NET runtime
+        var trustedAssembliesPaths = AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string;
+        if (!string.IsNullOrEmpty(trustedAssembliesPaths))
+        {
+            var paths = trustedAssembliesPaths.Split(Path.PathSeparator);
+            foreach (var path in paths)
+            {
+                if (File.Exists(path))
+                {
+                    references.Add(MetadataReference.CreateFromFile(path));
+                }
+            }
+        }
+        else
+        {
+            // Fallback: minimal corelib reference
+            references.Add(MetadataReference.CreateFromFile(typeof(object).Assembly.Location));
+        }
+
+        return references;
     }
 }
-
-#endregion
