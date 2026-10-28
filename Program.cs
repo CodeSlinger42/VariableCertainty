@@ -60,6 +60,7 @@ public class FolderValueTracker
     private readonly Compilation _compilation;
     private readonly HashSet<IMethodSymbol> _callStack = new(SymbolEqualityComparer.Default);
     private readonly List<INamedTypeSymbol> _allNamedTypes;
+    private readonly List<INamedTypeSymbol> _allConcreteTypes;
     
     // Global static heap: tracks "TypeName.FieldName" => VariableState
     private Dictionary<string, VariableState> _staticHeap = new();
@@ -68,6 +69,8 @@ public class FolderValueTracker
     {
         _compilation = compilation;
         _allNamedTypes = GetAllNamedTypes(compilation.Assembly.GlobalNamespace).ToList();
+        _allConcreteTypes = _allNamedTypes.Where(t => !t.IsAbstract && t.TypeKind != TypeKind.Interface).ToList();
+        
         EvaluateGlobalStaticState();
     }
 
@@ -431,7 +434,6 @@ public class FolderValueTracker
         Dictionary<string, VariableState> staticScope,
         INamedTypeSymbol? enclosingType = null)
     {
-        // 0. Roslyn Constant Folding Fast-Path (const string, const int, nameof(), etc.)
         var constantOpt = model.GetConstantValue(expr);
         if (constantOpt.HasValue && constantOpt.Value != null)
         {
@@ -767,61 +769,133 @@ public class FolderValueTracker
             : VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
     }
 
+    /// <summary>
+    /// Exhaustively locates all concrete implementations of an interface method, 
+    /// handling open/constructed generics, explicit implementations, inherited interfaces,
+    /// abstract base intermediaries, and loose signature duck-matching.
+    /// </summary>
     private List<IMethodSymbol> ResolveImplementationCandidates(IMethodSymbol targetMethod)
     {
-        var results = new List<IMethodSymbol>();
+        var results = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
         var containingType = targetMethod.ContainingType;
 
         if (containingType == null)
-            return results;
+            return results.ToList();
 
+        // CASE 1: Interface Call
         if (containingType.TypeKind == TypeKind.Interface)
         {
-            foreach (var type in _allNamedTypes)
-            {
-                if (type.IsAbstract || type.TypeKind == TypeKind.Interface)
-                    continue;
+            var targetOriginalInterface = containingType.OriginalDefinition;
+            var targetOriginalMethod = targetMethod.OriginalDefinition;
 
-                if (type.AllInterfaces.Any(i => SymbolEqualityComparer.Default.Equals(i, containingType)))
+            foreach (var type in _allConcreteTypes)
+            {
+                // 1a. Standard Roslyn Interface Member mapping (handling constructed generics)
+                foreach (var iface in type.AllInterfaces)
                 {
-                    if (type.FindImplementationForInterfaceMember(targetMethod) is IMethodSymbol impl)
-                        results.Add(impl);
+                    if (SymbolEqualityComparer.Default.Equals(iface, containingType) ||
+                        SymbolEqualityComparer.Default.Equals(iface.OriginalDefinition, targetOriginalInterface))
+                    {
+                        var impl = type.FindImplementationForInterfaceMember(targetMethod) as IMethodSymbol
+                                ?? type.FindImplementationForInterfaceMember(targetOriginalMethod) as IMethodSymbol;
+
+                        if (impl != null)
+                        {
+                            AddResolvedMethodAndOverrides(impl, results);
+                        }
+                    }
+                }
+
+                // 1b. Fallback: Explicit or Implicit name & signature matching across all methods on the type
+                // Catches cases where Roslyn generic type substitution fails to map cleanly
+                foreach (var member in type.GetMembers().OfType<IMethodSymbol>())
+                {
+                    if (member.IsAbstract) continue;
+
+                    // Explicit interface member check:
+                    if (member.ExplicitInterfaceImplementations.Any(e => 
+                        SymbolEqualityComparer.Default.Equals(e, targetMethod) || 
+                        SymbolEqualityComparer.Default.Equals(e.OriginalDefinition, targetOriginalMethod)))
+                    {
+                        AddResolvedMethodAndOverrides(member, results);
+                        continue;
+                    }
+
+                    // Duck-typing / implicit match on name, parameter count, and generic arity:
+                    if (member.Name == targetMethod.Name && 
+                        member.Parameters.Length == targetMethod.Parameters.Length &&
+                        member.Arity == targetMethod.Arity)
+                    {
+                        // Verify that the type actually implements this interface somewhere in its hierarchy
+                        bool implementsTarget = type.AllInterfaces.Any(i => 
+                            SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, targetOriginalInterface) ||
+                            i.Name == containingType.Name);
+
+                        if (implementsTarget)
+                        {
+                            AddResolvedMethodAndOverrides(member, results);
+                        }
+                    }
                 }
             }
-            return results;
+
+            return results.ToList();
         }
 
+        // CASE 2: Abstract or Virtual Method Call (trace down inheritance tree)
         if (targetMethod.IsAbstract || targetMethod.IsVirtual)
         {
-            foreach (var type in _allNamedTypes)
-            {
-                if (type.IsAbstract) continue;
-
-                var curr = type;
-                while (curr != null)
-                {
-                    if (SymbolEqualityComparer.Default.Equals(curr.BaseType, containingType))
-                    {
-                        var matchingOverride = type.GetMembers(targetMethod.Name)
-                            .OfType<IMethodSymbol>()
-                            .FirstOrDefault(m => m.IsOverride && SymbolEqualityComparer.Default.Equals(m.OverriddenMethod, targetMethod));
-
-                        if (matchingOverride != null)
-                            results.Add(matchingOverride);
-                        break;
-                    }
-                    curr = curr.BaseType;
-                }
-            }
-
-            if (!targetMethod.IsAbstract)
-                results.Add(targetMethod);
-
-            return results;
+            AddResolvedMethodAndOverrides(targetMethod, results);
+            return results.ToList();
         }
 
+        // CASE 3: Direct concrete method
         results.Add(targetMethod);
-        return results;
+        return results.ToList();
+    }
+
+    /// <summary>
+    /// If a candidate implementation is virtual or abstract (e.g., declared on an intermediate base class),
+    /// this recursively collects all concrete derived overrides across the entire solution.
+    /// </summary>
+    private void AddResolvedMethodAndOverrides(IMethodSymbol method, HashSet<IMethodSymbol> bucket)
+    {
+        if (!method.IsAbstract)
+        {
+            bucket.Add(method);
+        }
+
+        if (!method.IsVirtual && !method.IsAbstract && !method.IsOverride)
+            return;
+
+        var declType = method.ContainingType;
+
+        foreach (var subType in _allConcreteTypes)
+        {
+            if (SymbolEqualityComparer.Default.Equals(subType, declType))
+                continue;
+
+            // Check if subType derives from declType
+            var curr = subType.BaseType;
+            while (curr != null)
+            {
+                if (SymbolEqualityComparer.Default.Equals(curr.OriginalDefinition, declType.OriginalDefinition))
+                {
+                    var matchingOverride = subType.GetMembers(method.Name)
+                        .OfType<IMethodSymbol>()
+                        .FirstOrDefault(m => m.IsOverride && 
+                                             (SymbolEqualityComparer.Default.Equals(m.OverriddenMethod, method) || 
+                                              SymbolEqualityComparer.Default.Equals(m.OverriddenMethod?.OriginalDefinition, method.OriginalDefinition)));
+
+                    if (matchingOverride != null && !matchingOverride.IsAbstract)
+                    {
+                        bucket.Add(matchingOverride);
+                    }
+                    break;
+                }
+                curr = curr.BaseType;
+            }
+        }
     }
 
     private VariableState ComputeBinaryOp(string op, VariableState left, VariableState right)
