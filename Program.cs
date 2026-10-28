@@ -31,7 +31,38 @@ public abstract record SymbolicValue
 
     public sealed record SymbolicExpression(string Op, ImmutableList<SymbolicValue> Operands) : SymbolicValue
     {
-        public override string ToString() => $"{Op}({string.Join(", ", Operands)})";
+        public override string ToString()
+        {
+            if (Operands.Count == 2)
+            {
+                return $"({Operands[0]} {Op} {Operands[1]})";
+            }
+            return $"{Op}({string.Join(", ", Operands)})";
+        }
+    }
+
+    // Factored choice-set representing {v1, v2, ...} at a single branch/call point
+    public sealed record ChoiceSet(ImmutableSortedSet<string> Representations) : SymbolicValue
+    {
+        public static ChoiceSet FromValues(IEnumerable<SymbolicValue> values)
+        {
+            var reps = ImmutableSortedSet.CreateBuilder<string>(StringComparer.Ordinal);
+            foreach (var v in values)
+            {
+                if (v is ChoiceSet cs)
+                    reps.UnionWith(cs.Representations);
+                else
+                    reps.Add(v.ToString() ?? "null");
+            }
+            return new ChoiceSet(reps.ToImmutable());
+        }
+
+        public override string ToString()
+        {
+            if (Representations.Count == 0) return "∅";
+            if (Representations.Count == 1) return Representations.First();
+            return $"{{{string.Join(", ", Representations)}}}";
+        }
     }
 
     public sealed record StringBuilderInstance(string InstanceId) : SymbolicValue
@@ -52,8 +83,27 @@ public record VariableState
     public VariableState Union(VariableState other) => 
         new() { PossibleValues = PossibleValues.Union(other.PossibleValues) };
 
-    public override string ToString() => 
-        PossibleValues.Count == 0 ? "∅ (Unassigned)" : string.Join(", ", PossibleValues.OrderBy(v => v.ToString()));
+    /// <summary>
+    /// Compact output renderer: collapses multiple choices into a factored ChoiceSet representation.
+    /// </summary>
+    public string ToFactoredString()
+    {
+        if (PossibleValues.Count == 0) return "∅ (Unassigned)";
+        if (PossibleValues.Count == 1) return PossibleValues.First().ToString()!;
+
+        // Check if all values are constants
+        bool allConstants = PossibleValues.All(v => v is SymbolicValue.Constant);
+        if (allConstants)
+        {
+            return $"{{{string.Join(", ", PossibleValues.Select(v => v.ToString()).OrderBy(s => s))}}}";
+        }
+
+        // Collapse into factored representation
+        var choice = SymbolicValue.ChoiceSet.FromValues(PossibleValues);
+        return choice.ToString();
+    }
+
+    public override string ToString() => ToFactoredString();
 }
 
 #endregion
@@ -69,7 +119,6 @@ public class FolderValueTracker
     private readonly List<INamedTypeSymbol> _allNamedTypes;
     private readonly List<INamedTypeSymbol> _allConcreteTypes;
     
-    // Global static heap: tracks "TypeName.FieldName" => VariableState
     private Dictionary<string, VariableState> _staticHeap = new();
     private int _sbCounter = 0;
 
@@ -341,7 +390,6 @@ public class FolderValueTracker
             ["$return"] = VariableState.Empty
         };
 
-        // Seed parameters from call-site arguments if present, else tag as external inputs
         if (method.ParameterList != null)
         {
             foreach (var param in method.ParameterList.Parameters)
@@ -586,7 +634,6 @@ public class FolderValueTracker
                 return ComputeBinaryOp(bin.OperatorToken.Text, leftVals, rightVals);
 
             case InvocationExpressionSyntax inv:
-                // 1. StringBuilder methods
                 if (inv.Expression is MemberAccessExpressionSyntax sbMethodAccess)
                 {
                     var targetType = model.GetTypeInfo(sbMethodAccess.Expression).Type;
@@ -597,7 +644,6 @@ public class FolderValueTracker
                     }
                 }
 
-                // 2. string.Format(...)
                 var invokedSymbol = model.GetSymbolInfo(inv).Symbol as IMethodSymbol;
                 if (invokedSymbol != null && 
                     invokedSymbol.ContainingType.SpecialType == SpecialType.System_String && 
@@ -607,7 +653,6 @@ public class FolderValueTracker
                     return EvaluateStringFormatInvocation(inv, env, model, staticScope, enclosingType);
                 }
 
-                // 3. Method Invocations (Private, Public, Interface, Abstract)
                 return ResolveInvocation(inv, env, model, staticScope, enclosingType);
 
             case InterpolatedStringExpressionSyntax interpolated:
@@ -728,99 +773,58 @@ public class FolderValueTracker
         Dictionary<string, VariableState> staticScope,
         INamedTypeSymbol? enclosingType)
     {
-        var slicesPossibilities = new List<List<(string Rendered, bool IsSymbolic)>>();
+        var factoredParts = new List<SymbolicValue>();
+        bool hasNonConstant = false;
 
         foreach (var content in interpolated.Contents)
         {
-            switch (content)
+            if (content is InterpolatedStringTextSyntax textSyntax)
             {
-                case InterpolatedStringTextSyntax textSyntax:
-                    slicesPossibilities.Add(new List<(string, bool)> 
-                    { 
-                        (textSyntax.TextToken.ValueText, false) 
-                    });
-                    break;
+                factoredParts.Add(new SymbolicValue.Constant(textSyntax.TextToken.ValueText));
+            }
+            else if (content is InterpolationSyntax hole)
+            {
+                var holeValues = EvaluateExpression(hole.Expression, env, model, staticScope, enclosingType);
+                string? formatString = hole.FormatClause?.FormatStringToken.ValueText;
 
-                case InterpolationSyntax hole:
-                    var holeValues = EvaluateExpression(hole.Expression, env, model, staticScope, enclosingType);
-                    var holeOptions = new List<(string Rendered, bool IsSymbolic)>();
-
-                    string? formatString = hole.FormatClause?.FormatStringToken.ValueText;
-                    int? alignment = null;
-                    if (hole.AlignmentClause?.Value is LiteralExpressionSyntax { Token.Value: int alignVal })
+                if (holeValues.PossibleValues.Count == 1 && holeValues.PossibleValues.First() is SymbolicValue.Constant c && c.Value != null)
+                {
+                    string formatted = !string.IsNullOrEmpty(formatString)
+                        ? string.Format(CultureInfo.InvariantCulture, $"{{0:{formatString}}}", c.Value)
+                        : c.Value.ToString() ?? "";
+                    factoredParts.Add(new SymbolicValue.Constant(formatted));
+                }
+                else
+                {
+                    hasNonConstant = true;
+                    if (holeValues.PossibleValues.All(v => v is SymbolicValue.Constant))
                     {
-                        alignment = alignVal;
-                    }
-
-                    foreach (var val in holeValues.PossibleValues)
-                    {
-                        if (val is SymbolicValue.Constant c && c.Value != null)
+                        var formattedConstants = holeValues.PossibleValues.Select(v =>
                         {
-                            try
-                            {
-                                string formatted;
-                                if (!string.IsNullOrEmpty(formatString))
-                                {
-                                    formatted = string.Format(CultureInfo.InvariantCulture, $"{{0:{formatString}}}", c.Value);
-                                }
-                                else
-                                {
-                                    formatted = c.Value.ToString() ?? "";
-                                }
-
-                                if (alignment.HasValue)
-                                {
-                                    formatted = string.Format(CultureInfo.InvariantCulture, $"{{0,{alignment.Value}}}", formatted);
-                                }
-
-                                holeOptions.Add((formatted, false));
-                            }
-                            catch
-                            {
-                                holeOptions.Add((c.Value.ToString() ?? "", false));
-                            }
-                        }
-                        else
-                        {
-                            string repr = val.ToString() ?? "?";
-                            if (!string.IsNullOrEmpty(formatString))
-                                repr = $"{{{repr}:{formatString}}}";
-                            else
-                                repr = $"{{{repr}}}";
-
-                            holeOptions.Add((repr, true));
-                        }
+                            var raw = ((SymbolicValue.Constant)v).Value;
+                            return !string.IsNullOrEmpty(formatString)
+                                ? string.Format(CultureInfo.InvariantCulture, $"{{0:{formatString}}}", raw)
+                                : raw?.ToString() ?? "";
+                        }).Select(s => (SymbolicValue)new SymbolicValue.Constant(s));
+                        
+                        factoredParts.Add(SymbolicValue.ChoiceSet.FromValues(formattedConstants));
                     }
-
-                    if (holeOptions.Count == 0)
+                    else
                     {
-                        holeOptions.Add(("{<?>}", true));
+                        factoredParts.Add(SymbolicValue.ChoiceSet.FromValues(holeValues.PossibleValues));
                     }
-
-                    slicesPossibilities.Add(holeOptions);
-                    break;
+                }
             }
         }
 
-        var combinations = CartesianProduct(slicesPossibilities);
-        var results = ImmutableHashSet.CreateBuilder<SymbolicValue>();
-
-        foreach (var combination in combinations)
+        if (!hasNonConstant && factoredParts.All(p => p is SymbolicValue.Constant))
         {
-            bool hasAnySymbolic = combination.Any(c => c.IsSymbolic);
-            string fullString = string.Concat(combination.Select(c => c.Rendered));
-
-            if (hasAnySymbolic)
-            {
-                results.Add(new SymbolicValue.UnknownInput($"$\"{fullString}\"", "Interpolated Template"));
-            }
-            else
-            {
-                results.Add(new SymbolicValue.Constant(fullString));
-            }
+            return VariableState.Single(new SymbolicValue.Constant(string.Concat(factoredParts.Select(p => ((SymbolicValue.Constant)p).Value))));
         }
 
-        return new VariableState { PossibleValues = results.ToImmutable() };
+        // Return factored template representation
+        string template = string.Concat(factoredParts.Select(p => p is SymbolicValue.Constant c ? c.Value?.ToString() : $"{{{p}}}"));
+        return VariableState.Single(new SymbolicValue.UnknownInput($"$\"{template}\"", "Interpolated Template"));
     }
 
     private VariableState EvaluateStringFormatInvocation(
@@ -843,7 +847,6 @@ public class FolderValueTracker
             return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Invalid string.Format invocation"));
 
         var formatPatternValues = EvaluateExpression(args[formatIndex].Expression, env, model, staticScope, enclosingType);
-
         var argValuesList = new List<VariableState>();
         for (int i = formatIndex + 1; i < args.Count; i++)
         {
@@ -851,33 +854,21 @@ public class FolderValueTracker
         }
 
         var results = ImmutableHashSet.CreateBuilder<SymbolicValue>();
-
         foreach (var patternVal in formatPatternValues.PossibleValues)
         {
             if (patternVal is SymbolicValue.Constant { Value: string formatPattern })
             {
-                var argPermutations = CartesianProduct(argValuesList.Select(a => a.PossibleValues.ToList()).ToList());
-
-                foreach (var argPerm in argPermutations)
+                bool allArgsConstantSingle = argValuesList.All(a => a.PossibleValues.Count == 1 && a.PossibleValues.First() is SymbolicValue.Constant);
+                if (allArgsConstantSingle)
                 {
-                    bool allConstants = argPerm.All(p => p is SymbolicValue.Constant);
-                    if (allConstants)
-                    {
-                        var rawArgs = argPerm.Select(p => ((SymbolicValue.Constant)p).Value).ToArray();
-                        try
-                        {
-                            string formatted = string.Format(CultureInfo.InvariantCulture, formatPattern, rawArgs);
-                            results.Add(new SymbolicValue.Constant(formatted));
-                        }
-                        catch
-                        {
-                            results.Add(new SymbolicValue.UnknownInput($"string.Format(\"{formatPattern}\")", "Format error"));
-                        }
-                    }
-                    else
-                    {
-                        results.Add(new SymbolicValue.UnknownInput($"string.Format(\"{formatPattern}\", {string.Join(", ", argPerm)})", "Parameterized Format"));
-                    }
+                    var rawArgs = argValuesList.Select(a => ((SymbolicValue.Constant)a.PossibleValues.First()).Value).ToArray();
+                    results.Add(new SymbolicValue.Constant(string.Format(CultureInfo.InvariantCulture, formatPattern, rawArgs)));
+                }
+                else
+                {
+                    // Factor arguments into ChoiceSets rather than producing Cartesian products
+                    var factoredArgs = argValuesList.Select(a => SymbolicValue.ChoiceSet.FromValues(a.PossibleValues));
+                    results.Add(new SymbolicValue.UnknownInput($"string.Format(\"{formatPattern}\", {string.Join(", ", factoredArgs)})", "Factored Format"));
                 }
             }
             else
@@ -889,31 +880,6 @@ public class FolderValueTracker
         return new VariableState { PossibleValues = results.ToImmutable() };
     }
 
-    private static List<List<T>> CartesianProduct<T>(List<List<T>> sequences)
-    {
-        var result = new List<List<T>> { new() };
-
-        foreach (var sequence in sequences)
-        {
-            var next = new List<List<T>>();
-            foreach (var acc in result)
-            {
-                foreach (var item in sequence)
-                {
-                    var clone = new List<T>(acc) { item };
-                    next.Add(clone);
-                }
-            }
-            result = next;
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Resolves method invocations, binding arguments from caller to callee and
-    /// searching both semantic symbols and local class syntax (private methods, local functions).
-    /// </summary>
     private VariableState ResolveInvocation(
         InvocationExpressionSyntax inv, 
         Dictionary<string, VariableState> env, 
@@ -925,7 +891,6 @@ public class FolderValueTracker
         var targetMethod = symbolInfo.Symbol as IMethodSymbol 
             ?? symbolInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
 
-        // 1. If Roslyn could not bind an IMethodSymbol, search enclosing class syntax for matching private helper
         if (targetMethod == null && enclosingType != null)
         {
             targetMethod = FindPrivateMethodInEnclosingType(inv, enclosingType);
@@ -950,7 +915,6 @@ public class FolderValueTracker
             var syntaxRef = candidate.DeclaringSyntaxReferences.FirstOrDefault();
             string methodSignatureKey = candidate.ToDisplayString();
 
-            // Recursion & Depth Guard
             if (_callStack.Contains(methodSignatureKey) || _callStack.Count >= MaxCallDepth)
             {
                 var fallback = new SymbolicValue.UnknownInput(
@@ -975,7 +939,6 @@ public class FolderValueTracker
 
                 var calleeModel = _compilation.GetSemanticModel(calleeDecl.SyntaxTree);
 
-                // Bind evaluated argument states into the callee parameter environment
                 var passedArgs = new Dictionary<string, VariableState>();
                 if (calleeDecl.ParameterList != null)
                 {
@@ -1002,9 +965,6 @@ public class FolderValueTracker
             : VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
     }
 
-    /// <summary>
-    /// Fallback resolver for same-class private methods and expression-bodied helpers.
-    /// </summary>
     private IMethodSymbol? FindPrivateMethodInEnclosingType(InvocationExpressionSyntax inv, INamedTypeSymbol enclosingType)
     {
         string methodName;
@@ -1030,7 +990,6 @@ public class FolderValueTracker
         if (containingType == null)
             return results.ToList();
 
-        // 1. Interface Call
         if (containingType.TypeKind == TypeKind.Interface)
         {
             var targetOriginalInterface = containingType.OriginalDefinition;
@@ -1084,14 +1043,12 @@ public class FolderValueTracker
             return results.ToList();
         }
 
-        // 2. Abstract or Virtual Method Call (trace down inheritance tree)
         if (targetMethod.IsAbstract || targetMethod.IsVirtual)
         {
             AddResolvedMethodAndOverrides(targetMethod, results);
             return results.ToList();
         }
 
-        // 3. Direct method (private, internal, or public on a concrete class)
         results.Add(targetMethod);
         return results.ToList();
     }
@@ -1135,45 +1092,58 @@ public class FolderValueTracker
         }
     }
 
+    /// <summary>
+    /// Computes binary operation, factoring multi-valued options into ChoiceSet disjunctions
+    /// rather than multiplying out full repetitive symbolic chains.
+    /// </summary>
     private VariableState ComputeBinaryOp(string op, VariableState left, VariableState right)
     {
-        var results = ImmutableHashSet.CreateBuilder<SymbolicValue>();
+        bool leftHasMultiple = left.PossibleValues.Count > 1;
+        bool rightHasMultiple = right.PossibleValues.Count > 1;
 
-        foreach (var l in left.PossibleValues)
+        // If both sides are small discrete integer sets, compute constant foldings directly
+        bool allConstants = left.PossibleValues.All(l => l is SymbolicValue.Constant) &&
+                            right.PossibleValues.All(r => r is SymbolicValue.Constant);
+
+        if (allConstants && left.PossibleValues.Count * right.PossibleValues.Count <= 8)
         {
-            foreach (var r in right.PossibleValues)
+            var folded = ImmutableHashSet.CreateBuilder<SymbolicValue>();
+            foreach (var l in left.PossibleValues)
             {
-                if (l is SymbolicValue.Constant { Value: int lInt } && r is SymbolicValue.Constant { Value: int rInt })
+                foreach (var r in right.PossibleValues)
                 {
-                    results.Add(op switch
+                    if (l is SymbolicValue.Constant { Value: int lInt } && r is SymbolicValue.Constant { Value: int rInt })
                     {
-                        "+" => new SymbolicValue.Constant(lInt + rInt),
-                        "-" => new SymbolicValue.Constant(lInt - rInt),
-                        "*" => new SymbolicValue.Constant(lInt * rInt),
-                        "/" when rInt != 0 => new SymbolicValue.Constant(lInt / rInt),
-                        _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
-                    });
-                }
-                else if (op == "+" && (l is SymbolicValue.Constant { Value: string } || r is SymbolicValue.Constant { Value: string } ||
-                                       l is SymbolicValue.Constant { Value: not null } || r is SymbolicValue.Constant { Value: not null }))
-                {
-                    if (l is SymbolicValue.Constant lc && r is SymbolicValue.Constant rc)
-                    {
-                        results.Add(new SymbolicValue.Constant($"{lc.Value}{rc.Value}"));
+                        folded.Add(op switch
+                        {
+                            "+" => new SymbolicValue.Constant(lInt + rInt),
+                            "-" => new SymbolicValue.Constant(lInt - rInt),
+                            "*" => new SymbolicValue.Constant(lInt * rInt),
+                            "/" when rInt != 0 => new SymbolicValue.Constant(lInt / rInt),
+                            _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
+                        });
                     }
-                    else
+                    else if (op == "+" && (l is SymbolicValue.Constant { Value: string } || r is SymbolicValue.Constant { Value: string }))
                     {
-                        results.Add(new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r)));
+                        folded.Add(new SymbolicValue.Constant($"{((SymbolicValue.Constant)l).Value}{((SymbolicValue.Constant)r).Value}"));
                     }
-                }
-                else
-                {
-                    results.Add(new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r)));
                 }
             }
+            if (folded.Count > 0)
+                return new VariableState { PossibleValues = folded.ToImmutable() };
         }
 
-        return new VariableState { PossibleValues = results.ToImmutable() };
+        // Factor common side: if one side has multiple choices, wrap as a single ChoiceSet operand
+        SymbolicValue leftOperand = leftHasMultiple 
+            ? SymbolicValue.ChoiceSet.FromValues(left.PossibleValues) 
+            : left.PossibleValues.FirstOrDefault() ?? new SymbolicValue.Constant(0);
+
+        SymbolicValue rightOperand = rightHasMultiple 
+            ? SymbolicValue.ChoiceSet.FromValues(right.PossibleValues) 
+            : right.PossibleValues.FirstOrDefault() ?? new SymbolicValue.Constant(0);
+
+        var expr = new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(leftOperand, rightOperand));
+        return VariableState.Single(expr);
     }
 }
 
@@ -1257,12 +1227,12 @@ public static class Program
 
             Console.WriteLine($"\n[>] Evaluating '{targetVar}' in {Path.GetFileName(matchedTree.FilePath)} at line {targetLine}:");
             var result = analyzer.EvaluateVariableAt(matchedTree, targetVar, targetLine);
-            Console.WriteLine($"Result: {result}\n");
+            Console.WriteLine($"Result: {result.ToFactoredString()}\n");
             return;
         }
 
         // MODE 2: Comprehensive Batch Scan
-        Console.WriteLine("\n=== Exhaustive Variable Scan ===");
+        Console.WriteLine("\n=== Compact Factored Variable Scan ===");
         foreach (var tree in syntaxTrees)
         {
             var root = tree.GetCompilationUnitRoot();
@@ -1281,7 +1251,7 @@ public static class Program
                 {
                     string name = v.Identifier.Text;
                     var result = analyzer.EvaluateVariableAt(tree, name, line);
-                    Console.WriteLine($"  Line {line,4} | {name,-16} => {result}");
+                    Console.WriteLine($"  Line {line,4} | {name,-16} => {result.ToFactoredString()}");
                 }
             }
         }
