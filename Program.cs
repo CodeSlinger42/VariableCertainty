@@ -34,7 +34,6 @@ public abstract record SymbolicValue
         public override string ToString() => $"{Op}({string.Join(", ", Operands)})";
     }
 
-    // Symbolic reference to a tracked mutable StringBuilder instance
     public sealed record StringBuilderInstance(string InstanceId) : SymbolicValue
     {
         public override string ToString() => $"<StringBuilder: {InstanceId}>";
@@ -64,14 +63,14 @@ public record VariableState
 public class FolderValueTracker
 {
     private readonly Compilation _compilation;
-    private readonly HashSet<IMethodSymbol> _callStack = new(SymbolEqualityComparer.Default);
+    private readonly HashSet<string> _callStack = new();
+    private const int MaxCallDepth = 12;
+
     private readonly List<INamedTypeSymbol> _allNamedTypes;
     private readonly List<INamedTypeSymbol> _allConcreteTypes;
     
     // Global static heap: tracks "TypeName.FieldName" => VariableState
     private Dictionary<string, VariableState> _staticHeap = new();
-    
-    // Global counter for deterministic StringBuilder instance IDs
     private int _sbCounter = 0;
 
     public FolderValueTracker(Compilation compilation)
@@ -288,9 +287,14 @@ public class FolderValueTracker
             ? model.GetDeclaredSymbol(containingType) as INamedTypeSymbol 
             : null;
 
-        var flowState = AnalyzeMethod(containingMethod, model, targetStatement, new Dictionary<string, VariableState>(_staticHeap), currentTypeSymbol);
+        var flowState = AnalyzeMethod(
+            containingMethod, 
+            model, 
+            targetStatement, 
+            new Dictionary<string, VariableState>(_staticHeap), 
+            currentTypeSymbol,
+            initialArguments: null);
 
-        // If the queried variable is a StringBuilder instance, materialize its buffered string values
         if (flowState.TryGetValue(variableName, out var state))
         {
             var materialized = ImmutableHashSet.CreateBuilder<SymbolicValue>();
@@ -329,19 +333,28 @@ public class FolderValueTracker
         SemanticModel model, 
         SyntaxNode? targetNode,
         Dictionary<string, VariableState> staticScope,
-        INamedTypeSymbol? enclosingType)
+        INamedTypeSymbol? enclosingType,
+        Dictionary<string, VariableState>? initialArguments = null)
     {
         var state = new Dictionary<string, VariableState>
         {
             ["$return"] = VariableState.Empty
         };
 
+        // Seed parameters from call-site arguments if present, else tag as external inputs
         if (method.ParameterList != null)
         {
             foreach (var param in method.ParameterList.Parameters)
             {
                 var paramName = param.Identifier.Text;
-                state[paramName] = VariableState.Single(new SymbolicValue.UnknownInput(paramName, "Method Parameter"));
+                if (initialArguments != null && initialArguments.TryGetValue(paramName, out var passedVal))
+                {
+                    state[paramName] = passedVal;
+                }
+                else
+                {
+                    state[paramName] = VariableState.Single(new SymbolicValue.UnknownInput(paramName, "Method Parameter"));
+                }
             }
         }
 
@@ -422,7 +435,6 @@ public class FolderValueTracker
                 }
                 else
                 {
-                    // Evaluates standalone invocations (e.g. sb.Append("..."), sb.Clear())
                     EvaluateExpression(exprStmt.Expression, state, model, staticScope, enclosingType);
                 }
                 break;
@@ -509,7 +521,6 @@ public class FolderValueTracker
             case CastExpressionSyntax cast:
                 return EvaluateExpression(cast.Expression, env, model, staticScope, enclosingType);
 
-            // Object Creation: new StringBuilder(...)
             case ObjectCreationExpressionSyntax objCreation:
                 var createdType = model.GetTypeInfo(objCreation).Type;
                 if (createdType != null && createdType.ToDisplayString() == "System.Text.StringBuilder")
@@ -575,7 +586,7 @@ public class FolderValueTracker
                 return ComputeBinaryOp(bin.OperatorToken.Text, leftVals, rightVals);
 
             case InvocationExpressionSyntax inv:
-                // 1. StringBuilder method handling: Append, AppendLine, Clear, Insert, ToString
+                // 1. StringBuilder methods
                 if (inv.Expression is MemberAccessExpressionSyntax sbMethodAccess)
                 {
                     var targetType = model.GetTypeInfo(sbMethodAccess.Expression).Type;
@@ -596,8 +607,8 @@ public class FolderValueTracker
                     return EvaluateStringFormatInvocation(inv, env, model, staticScope, enclosingType);
                 }
 
-                // 3. General & Interface method invocations
-                return ResolveInvocation(inv, env, model, staticScope);
+                // 3. Method Invocations (Private, Public, Interface, Abstract)
+                return ResolveInvocation(inv, env, model, staticScope, enclosingType);
 
             case InterpolatedStringExpressionSyntax interpolated:
                 return EvaluateInterpolatedString(interpolated, env, model, staticScope, enclosingType);
@@ -607,10 +618,6 @@ public class FolderValueTracker
         }
     }
 
-    /// <summary>
-    /// Processes StringBuilder member invocations, updating the mutable buffer in the environment
-    /// and supporting method chaining (e.g. sb.Append("a").Append("b")).
-    /// </summary>
     private VariableState? HandleStringBuilderInvocation(
         MemberAccessExpressionSyntax methodAccess,
         InvocationExpressionSyntax inv,
@@ -649,7 +656,6 @@ public class FolderValueTracker
                     env[bufKey] = ComputeBinaryOp("+", currentBuf, appendedVal);
                 }
 
-                // Returns the same StringBuilder instance reference for chaining
                 return sbInstanceVal;
             }
 
@@ -657,7 +663,7 @@ public class FolderValueTracker
             {
                 foreach (var inst in instances)
                 {
-                    env[$$"""$sb_buf_{{inst.InstanceId}}"""] = VariableState.Single(new SymbolicValue.Constant(""));
+                    env[$"$sb_buf_{inst.InstanceId}"] = VariableState.Single(new SymbolicValue.Constant(""));
                 }
                 return sbInstanceVal;
             }
@@ -904,15 +910,26 @@ public class FolderValueTracker
         return result;
     }
 
+    /// <summary>
+    /// Resolves method invocations, binding arguments from caller to callee and
+    /// searching both semantic symbols and local class syntax (private methods, local functions).
+    /// </summary>
     private VariableState ResolveInvocation(
         InvocationExpressionSyntax inv, 
         Dictionary<string, VariableState> env, 
         SemanticModel model,
-        Dictionary<string, VariableState> staticScope)
+        Dictionary<string, VariableState> staticScope,
+        INamedTypeSymbol? enclosingType)
     {
         var symbolInfo = model.GetSymbolInfo(inv);
         var targetMethod = symbolInfo.Symbol as IMethodSymbol 
             ?? symbolInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
+
+        // 1. If Roslyn could not bind an IMethodSymbol, search enclosing class syntax for matching private helper
+        if (targetMethod == null && enclosingType != null)
+        {
+            targetMethod = FindPrivateMethodInEnclosingType(inv, enclosingType);
+        }
 
         if (targetMethod == null)
             return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Unresolvable invocation"));
@@ -931,22 +948,47 @@ public class FolderValueTracker
         foreach (var candidate in candidates)
         {
             var syntaxRef = candidate.DeclaringSyntaxReferences.FirstOrDefault();
-            if (syntaxRef == null || _callStack.Contains(candidate))
+            string methodSignatureKey = candidate.ToDisplayString();
+
+            // Recursion & Depth Guard
+            if (_callStack.Contains(methodSignatureKey) || _callStack.Count >= MaxCallDepth)
             {
                 var fallback = new SymbolicValue.UnknownInput(
                     $"{candidate.ContainingType.Name}.{candidate.Name}()", 
-                    syntaxRef == null ? "External Library" : "Recursion Boundary");
+                    "Recursion Boundary");
+                aggregatedResult = aggregatedResult.Union(VariableState.Single(fallback));
+                continue;
+            }
+
+            if (syntaxRef == null)
+            {
+                var fallback = new SymbolicValue.UnknownInput(
+                    $"{candidate.ContainingType.Name}.{candidate.Name}()", 
+                    "External Library");
                 aggregatedResult = aggregatedResult.Union(VariableState.Single(fallback));
                 continue;
             }
 
             if (syntaxRef.GetSyntax() is BaseMethodDeclarationSyntax calleeDecl)
             {
-                _callStack.Add(candidate);
+                _callStack.Add(methodSignatureKey);
+
                 var calleeModel = _compilation.GetSemanticModel(calleeDecl.SyntaxTree);
 
-                var calleeResult = AnalyzeMethod(calleeDecl, calleeModel, null, staticScope, candidate.ContainingType);
-                _callStack.Remove(candidate);
+                // Bind evaluated argument states into the callee parameter environment
+                var passedArgs = new Dictionary<string, VariableState>();
+                if (calleeDecl.ParameterList != null)
+                {
+                    for (int i = 0; i < inv.ArgumentList.Arguments.Count && i < calleeDecl.ParameterList.Parameters.Count; i++)
+                    {
+                        var argExpr = inv.ArgumentList.Arguments[i].Expression;
+                        var paramName = calleeDecl.ParameterList.Parameters[i].Identifier.Text;
+                        passedArgs[paramName] = EvaluateExpression(argExpr, env, model, staticScope, enclosingType);
+                    }
+                }
+
+                var calleeResult = AnalyzeMethod(calleeDecl, calleeModel, null, staticScope, candidate.ContainingType, passedArgs);
+                _callStack.Remove(methodSignatureKey);
 
                 if (calleeResult.TryGetValue("$return", out var retState) && retState.PossibleValues.Count > 0)
                 {
@@ -960,6 +1002,26 @@ public class FolderValueTracker
             : VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
     }
 
+    /// <summary>
+    /// Fallback resolver for same-class private methods and expression-bodied helpers.
+    /// </summary>
+    private IMethodSymbol? FindPrivateMethodInEnclosingType(InvocationExpressionSyntax inv, INamedTypeSymbol enclosingType)
+    {
+        string methodName;
+        if (inv.Expression is IdentifierNameSyntax id)
+            methodName = id.Identifier.Text;
+        else if (inv.Expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax } thisAccess)
+            methodName = thisAccess.Name.Identifier.Text;
+        else
+            return null;
+
+        int argCount = inv.ArgumentList.Arguments.Count;
+
+        return enclosingType.GetMembers(methodName)
+            .OfType<IMethodSymbol>()
+            .FirstOrDefault(m => m.Parameters.Length == argCount);
+    }
+
     private List<IMethodSymbol> ResolveImplementationCandidates(IMethodSymbol targetMethod)
     {
         var results = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
@@ -968,6 +1030,7 @@ public class FolderValueTracker
         if (containingType == null)
             return results.ToList();
 
+        // 1. Interface Call
         if (containingType.TypeKind == TypeKind.Interface)
         {
             var targetOriginalInterface = containingType.OriginalDefinition;
@@ -1021,12 +1084,14 @@ public class FolderValueTracker
             return results.ToList();
         }
 
+        // 2. Abstract or Virtual Method Call (trace down inheritance tree)
         if (targetMethod.IsAbstract || targetMethod.IsVirtual)
         {
             AddResolvedMethodAndOverrides(targetMethod, results);
             return results.ToList();
         }
 
+        // 3. Direct method (private, internal, or public on a concrete class)
         results.Add(targetMethod);
         return results.ToList();
     }
