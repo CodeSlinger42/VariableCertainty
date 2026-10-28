@@ -33,6 +33,12 @@ public abstract record SymbolicValue
     {
         public override string ToString() => $"{Op}({string.Join(", ", Operands)})";
     }
+
+    // Symbolic reference to a tracked mutable StringBuilder instance
+    public sealed record StringBuilderInstance(string InstanceId) : SymbolicValue
+    {
+        public override string ToString() => $"<StringBuilder: {InstanceId}>";
+    }
 }
 
 public record VariableState
@@ -64,6 +70,9 @@ public class FolderValueTracker
     
     // Global static heap: tracks "TypeName.FieldName" => VariableState
     private Dictionary<string, VariableState> _staticHeap = new();
+    
+    // Global counter for deterministic StringBuilder instance IDs
+    private int _sbCounter = 0;
 
     public FolderValueTracker(Compilation compilation)
     {
@@ -281,9 +290,38 @@ public class FolderValueTracker
 
         var flowState = AnalyzeMethod(containingMethod, model, targetStatement, new Dictionary<string, VariableState>(_staticHeap), currentTypeSymbol);
 
-        return flowState.TryGetValue(variableName, out var state) 
-            ? state 
-            : VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Unresolved / out of scope"));
+        // If the queried variable is a StringBuilder instance, materialize its buffered string values
+        if (flowState.TryGetValue(variableName, out var state))
+        {
+            var materialized = ImmutableHashSet.CreateBuilder<SymbolicValue>();
+            bool hasSb = false;
+
+            foreach (var val in state.PossibleValues)
+            {
+                if (val is SymbolicValue.StringBuilderInstance sb)
+                {
+                    hasSb = true;
+                    if (flowState.TryGetValue($"$sb_buf_{sb.InstanceId}", out var bufState))
+                    {
+                        materialized.UnionWith(bufState.PossibleValues);
+                    }
+                    else
+                    {
+                        materialized.Add(new SymbolicValue.Constant(""));
+                    }
+                }
+                else
+                {
+                    materialized.Add(val);
+                }
+            }
+
+            return hasSb 
+                ? new VariableState { PossibleValues = materialized.ToImmutable() } 
+                : state;
+        }
+
+        return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Unresolved / out of scope"));
     }
 
     private Dictionary<string, VariableState> AnalyzeMethod(
@@ -362,22 +400,30 @@ public class FolderValueTracker
                 }
                 break;
 
-            case ExpressionStatementSyntax exprStmt when exprStmt.Expression is AssignmentExpressionSyntax assign:
-                var assignedValue = EvaluateExpression(assign.Right, state, model, staticScope, enclosingType);
-                
-                var leftSymbol = model.GetSymbolInfo(assign.Left).Symbol;
-                if (leftSymbol is IFieldSymbol { IsStatic: true } staticField)
+            case ExpressionStatementSyntax exprStmt:
+                if (exprStmt.Expression is AssignmentExpressionSyntax assign)
                 {
-                    string key = $"{staticField.ContainingType.ToDisplayString()}.{staticField.Name}";
-                    staticScope[key] = assignedValue;
-                    if (_staticHeap.ContainsKey(key))
-                        _staticHeap[key] = _staticHeap[key].Union(assignedValue);
+                    var assignedValue = EvaluateExpression(assign.Right, state, model, staticScope, enclosingType);
+                    
+                    var leftSymbol = model.GetSymbolInfo(assign.Left).Symbol;
+                    if (leftSymbol is IFieldSymbol { IsStatic: true } staticField)
+                    {
+                        string key = $"{staticField.ContainingType.ToDisplayString()}.{staticField.Name}";
+                        staticScope[key] = assignedValue;
+                        if (_staticHeap.ContainsKey(key))
+                            _staticHeap[key] = _staticHeap[key].Union(assignedValue);
+                        else
+                            _staticHeap[key] = assignedValue;
+                    }
                     else
-                        _staticHeap[key] = assignedValue;
+                    {
+                        state[assign.Left.ToString()] = assignedValue;
+                    }
                 }
                 else
                 {
-                    state[assign.Left.ToString()] = assignedValue;
+                    // Evaluates standalone invocations (e.g. sb.Append("..."), sb.Clear())
+                    EvaluateExpression(exprStmt.Expression, state, model, staticScope, enclosingType);
                 }
                 break;
 
@@ -463,6 +509,30 @@ public class FolderValueTracker
             case CastExpressionSyntax cast:
                 return EvaluateExpression(cast.Expression, env, model, staticScope, enclosingType);
 
+            // Object Creation: new StringBuilder(...)
+            case ObjectCreationExpressionSyntax objCreation:
+                var createdType = model.GetTypeInfo(objCreation).Type;
+                if (createdType != null && createdType.ToDisplayString() == "System.Text.StringBuilder")
+                {
+                    string instanceId = $"sb_{++_sbCounter}";
+                    var initialBuf = VariableState.Single(new SymbolicValue.Constant(""));
+
+                    if (objCreation.ArgumentList != null && objCreation.ArgumentList.Arguments.Count > 0)
+                    {
+                        var firstArg = objCreation.ArgumentList.Arguments[0].Expression;
+                        var firstArgType = model.GetTypeInfo(firstArg).Type;
+                        if (firstArgType != null && firstArgType.SpecialType == SpecialType.System_String)
+                        {
+                            initialBuf = EvaluateExpression(firstArg, env, model, staticScope, enclosingType);
+                        }
+                    }
+
+                    env[$"$sb_buf_{instanceId}"] = initialBuf;
+                    return VariableState.Single(new SymbolicValue.StringBuilderInstance(instanceId));
+                }
+
+                return VariableState.Single(new SymbolicValue.UnknownInput(objCreation.Type.ToString(), "New Object Instance"));
+
             case IdentifierNameSyntax id:
                 var name = id.Identifier.Text;
                 if (env.TryGetValue(name, out var localVal))
@@ -505,6 +575,18 @@ public class FolderValueTracker
                 return ComputeBinaryOp(bin.OperatorToken.Text, leftVals, rightVals);
 
             case InvocationExpressionSyntax inv:
+                // 1. StringBuilder method handling: Append, AppendLine, Clear, Insert, ToString
+                if (inv.Expression is MemberAccessExpressionSyntax sbMethodAccess)
+                {
+                    var targetType = model.GetTypeInfo(sbMethodAccess.Expression).Type;
+                    if (targetType != null && targetType.ToDisplayString() == "System.Text.StringBuilder")
+                    {
+                        var sbResult = HandleStringBuilderInvocation(sbMethodAccess, inv, env, model, staticScope, enclosingType);
+                        if (sbResult != null) return sbResult;
+                    }
+                }
+
+                // 2. string.Format(...)
                 var invokedSymbol = model.GetSymbolInfo(inv).Symbol as IMethodSymbol;
                 if (invokedSymbol != null && 
                     invokedSymbol.ContainingType.SpecialType == SpecialType.System_String && 
@@ -514,6 +596,7 @@ public class FolderValueTracker
                     return EvaluateStringFormatInvocation(inv, env, model, staticScope, enclosingType);
                 }
 
+                // 3. General & Interface method invocations
                 return ResolveInvocation(inv, env, model, staticScope);
 
             case InterpolatedStringExpressionSyntax interpolated:
@@ -521,6 +604,114 @@ public class FolderValueTracker
 
             default:
                 return VariableState.Single(new SymbolicValue.UnknownInput(expr.ToString(), "Expression"));
+        }
+    }
+
+    /// <summary>
+    /// Processes StringBuilder member invocations, updating the mutable buffer in the environment
+    /// and supporting method chaining (e.g. sb.Append("a").Append("b")).
+    /// </summary>
+    private VariableState? HandleStringBuilderInvocation(
+        MemberAccessExpressionSyntax methodAccess,
+        InvocationExpressionSyntax inv,
+        Dictionary<string, VariableState> env,
+        SemanticModel model,
+        Dictionary<string, VariableState> staticScope,
+        INamedTypeSymbol? enclosingType)
+    {
+        string methodName = methodAccess.Name.Identifier.Text;
+        var sbInstanceVal = EvaluateExpression(methodAccess.Expression, env, model, staticScope, enclosingType);
+        
+        var instances = sbInstanceVal.PossibleValues
+            .OfType<SymbolicValue.StringBuilderInstance>()
+            .ToList();
+
+        if (instances.Count == 0) return null;
+
+        switch (methodName)
+        {
+            case "Append":
+            case "AppendLine":
+            {
+                var appendedVal = inv.ArgumentList.Arguments.Count > 0
+                    ? EvaluateExpression(inv.ArgumentList.Arguments[0].Expression, env, model, staticScope, enclosingType)
+                    : VariableState.Single(new SymbolicValue.Constant(""));
+
+                if (methodName == "AppendLine")
+                {
+                    appendedVal = ComputeBinaryOp("+", appendedVal, VariableState.Single(new SymbolicValue.Constant("\n")));
+                }
+
+                foreach (var inst in instances)
+                {
+                    string bufKey = $"$sb_buf_{inst.InstanceId}";
+                    var currentBuf = env.TryGetValue(bufKey, out var b) ? b : VariableState.Single(new SymbolicValue.Constant(""));
+                    env[bufKey] = ComputeBinaryOp("+", currentBuf, appendedVal);
+                }
+
+                // Returns the same StringBuilder instance reference for chaining
+                return sbInstanceVal;
+            }
+
+            case "Clear":
+            {
+                foreach (var inst in instances)
+                {
+                    env[$$"""$sb_buf_{{inst.InstanceId}}"""] = VariableState.Single(new SymbolicValue.Constant(""));
+                }
+                return sbInstanceVal;
+            }
+
+            case "Insert":
+            {
+                if (inv.ArgumentList.Arguments.Count >= 2)
+                {
+                    var indexVal = EvaluateExpression(inv.ArgumentList.Arguments[0].Expression, env, model, staticScope, enclosingType);
+                    var insertedVal = EvaluateExpression(inv.ArgumentList.Arguments[1].Expression, env, model, staticScope, enclosingType);
+
+                    bool isPrepend = indexVal.PossibleValues.All(v => v is SymbolicValue.Constant { Value: 0 });
+
+                    foreach (var inst in instances)
+                    {
+                        string bufKey = $"$sb_buf_{inst.InstanceId}";
+                        var currentBuf = env.TryGetValue(bufKey, out var b) ? b : VariableState.Single(new SymbolicValue.Constant(""));
+
+                        if (isPrepend)
+                        {
+                            env[bufKey] = ComputeBinaryOp("+", insertedVal, currentBuf);
+                        }
+                        else
+                        {
+                            env[bufKey] = VariableState.Single(new SymbolicValue.SymbolicExpression("Insert", ImmutableList.Create<SymbolicValue>(
+                                new SymbolicValue.Constant(inst.InstanceId),
+                                new SymbolicValue.UnknownInput(inv.ToString(), "Arbitrary Index Insert")
+                            )));
+                        }
+                    }
+                }
+                return sbInstanceVal;
+            }
+
+            case "ToString":
+            {
+                var aggregatedStrings = VariableState.Empty;
+                foreach (var inst in instances)
+                {
+                    string bufKey = $"$sb_buf_{inst.InstanceId}";
+                    if (env.TryGetValue(bufKey, out var bufState))
+                    {
+                        aggregatedStrings = aggregatedStrings.Union(bufState);
+                    }
+                    else
+                    {
+                        aggregatedStrings = aggregatedStrings.Union(VariableState.Single(new SymbolicValue.Constant("")));
+                    }
+                }
+                return aggregatedStrings;
+            }
+
+            default:
+                return null;
         }
     }
 
@@ -769,11 +960,6 @@ public class FolderValueTracker
             : VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
     }
 
-    /// <summary>
-    /// Exhaustively locates all concrete implementations of an interface method, 
-    /// handling open/constructed generics, explicit implementations, inherited interfaces,
-    /// abstract base intermediaries, and loose signature duck-matching.
-    /// </summary>
     private List<IMethodSymbol> ResolveImplementationCandidates(IMethodSymbol targetMethod)
     {
         var results = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
@@ -782,7 +968,6 @@ public class FolderValueTracker
         if (containingType == null)
             return results.ToList();
 
-        // CASE 1: Interface Call
         if (containingType.TypeKind == TypeKind.Interface)
         {
             var targetOriginalInterface = containingType.OriginalDefinition;
@@ -790,7 +975,6 @@ public class FolderValueTracker
 
             foreach (var type in _allConcreteTypes)
             {
-                // 1a. Standard Roslyn Interface Member mapping (handling constructed generics)
                 foreach (var iface in type.AllInterfaces)
                 {
                     if (SymbolEqualityComparer.Default.Equals(iface, containingType) ||
@@ -806,13 +990,10 @@ public class FolderValueTracker
                     }
                 }
 
-                // 1b. Fallback: Explicit or Implicit name & signature matching across all methods on the type
-                // Catches cases where Roslyn generic type substitution fails to map cleanly
                 foreach (var member in type.GetMembers().OfType<IMethodSymbol>())
                 {
                     if (member.IsAbstract) continue;
 
-                    // Explicit interface member check:
                     if (member.ExplicitInterfaceImplementations.Any(e => 
                         SymbolEqualityComparer.Default.Equals(e, targetMethod) || 
                         SymbolEqualityComparer.Default.Equals(e.OriginalDefinition, targetOriginalMethod)))
@@ -821,12 +1002,10 @@ public class FolderValueTracker
                         continue;
                     }
 
-                    // Duck-typing / implicit match on name, parameter count, and generic arity:
                     if (member.Name == targetMethod.Name && 
                         member.Parameters.Length == targetMethod.Parameters.Length &&
                         member.Arity == targetMethod.Arity)
                     {
-                        // Verify that the type actually implements this interface somewhere in its hierarchy
                         bool implementsTarget = type.AllInterfaces.Any(i => 
                             SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, targetOriginalInterface) ||
                             i.Name == containingType.Name);
@@ -842,22 +1021,16 @@ public class FolderValueTracker
             return results.ToList();
         }
 
-        // CASE 2: Abstract or Virtual Method Call (trace down inheritance tree)
         if (targetMethod.IsAbstract || targetMethod.IsVirtual)
         {
             AddResolvedMethodAndOverrides(targetMethod, results);
             return results.ToList();
         }
 
-        // CASE 3: Direct concrete method
         results.Add(targetMethod);
         return results.ToList();
     }
 
-    /// <summary>
-    /// If a candidate implementation is virtual or abstract (e.g., declared on an intermediate base class),
-    /// this recursively collects all concrete derived overrides across the entire solution.
-    /// </summary>
     private void AddResolvedMethodAndOverrides(IMethodSymbol method, HashSet<IMethodSymbol> bucket)
     {
         if (!method.IsAbstract)
@@ -875,7 +1048,6 @@ public class FolderValueTracker
             if (SymbolEqualityComparer.Default.Equals(subType, declType))
                 continue;
 
-            // Check if subType derives from declType
             var curr = subType.BaseType;
             while (curr != null)
             {
@@ -917,7 +1089,8 @@ public class FolderValueTracker
                         _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
                     });
                 }
-                else if (op == "+" && (l is SymbolicValue.Constant { Value: string } || r is SymbolicValue.Constant { Value: string }))
+                else if (op == "+" && (l is SymbolicValue.Constant { Value: string } || r is SymbolicValue.Constant { Value: string } ||
+                                       l is SymbolicValue.Constant { Value: not null } || r is SymbolicValue.Constant { Value: not null }))
                 {
                     if (l is SymbolicValue.Constant lc && r is SymbolicValue.Constant rc)
                     {
