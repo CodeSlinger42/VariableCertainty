@@ -46,7 +46,7 @@ public record VariableState
         new() { PossibleValues = PossibleValues.Union(other.PossibleValues) };
 
     public override string ToString() => 
-        PossibleValues.Count == 0 ? "∅ (Unassigned)" : string.Join(" ∪ ", PossibleValues);
+        PossibleValues.Count == 0 ? "∅ (Unassigned)" : string.Join(", ", PossibleValues.OrderBy(v => v.ToString()));
 }
 
 #endregion
@@ -63,23 +63,30 @@ public class IntraproceduralValueTracker
         _compilation = compilation;
     }
 
-    /// <summary>
-    /// Evaluates all possible values of an identifier at a specific line.
-    /// </summary>
     public VariableState EvaluateVariableAt(SyntaxTree tree, string variableName, int lineNumber)
     {
         var root = tree.GetCompilationUnitRoot();
         var model = _compilation.GetSemanticModel(tree);
 
-        var lineSpan = tree.GetText().Lines[lineNumber - 1].Span;
-        var node = root.FindNode(lineSpan);
+        var text = tree.GetText();
+        var line = text.Lines[lineNumber - 1];
 
-        var containingMethod = node.AncestorsAndSelf().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
+        // Find the statement on or immediately preceding this line
+        var targetStatement = root.DescendantNodes()
+            .OfType<StatementSyntax>()
+            .Where(s => text.Lines.GetLinePosition(s.SpanStart).Line <= lineNumber - 1)
+            .OrderByDescending(s => s.SpanStart)
+            .FirstOrDefault();
+
+        if (targetStatement == null)
+            return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Statement not found"));
+
+        var containingMethod = targetStatement.AncestorsAndSelf().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
         if (containingMethod == null)
             return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Outside method scope"));
 
-        var flowState = AnalyzeMethod(containingMethod, model, targetNode: node);
-        
+        var flowState = AnalyzeMethod(containingMethod, model, targetStatement);
+
         return flowState.TryGetValue(variableName, out var state) 
             ? state 
             : VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Unresolved / out of scope"));
@@ -90,9 +97,11 @@ public class IntraproceduralValueTracker
         SemanticModel model, 
         SyntaxNode? targetNode = null)
     {
-        var state = new Dictionary<string, VariableState>();
+        var state = new Dictionary<string, VariableState>
+        {
+            ["$return"] = VariableState.Empty
+        };
 
-        // 1. Seed parameters as external inputs or track forward
         if (method.ParameterList != null)
         {
             foreach (var param in method.ParameterList.Parameters)
@@ -102,15 +111,13 @@ public class IntraproceduralValueTracker
             }
         }
 
-        // 2. Iterate statements sequentially, handling branching and assignments
         if (method.Body != null)
         {
             AnalyzeBlock(method.Body, state, model, targetNode);
         }
         else if (method.ExpressionBody != null)
         {
-            var exprVal = EvaluateExpression(method.ExpressionBody.Expression, state, model);
-            state["$return"] = exprVal;
+            state["$return"] = EvaluateExpression(method.ExpressionBody.Expression, state, model);
         }
 
         return state;
@@ -124,70 +131,16 @@ public class IntraproceduralValueTracker
     {
         foreach (var statement in block.Statements)
         {
-            if (targetNode != null && statement.SpanStart > targetNode.Span.End)
-                return true; // Reached inspection point
+            bool reachedTarget = targetNode != null && statement == targetNode;
 
-            switch (statement)
-            {
-                case LocalDeclarationStatementSyntax decl:
-                    foreach (var variable in decl.Declaration.Variables)
-                    {
-                        var varName = variable.Identifier.Text;
-                        if (variable.Initializer != null)
-                        {
-                            state[varName] = EvaluateExpression(variable.Initializer.Value, state, model);
-                        }
-                        else
-                        {
-                            state[varName] = VariableState.Single(new SymbolicValue.Constant(GetDefaultValue(decl.Declaration.Type, model)));
-                        }
-                    }
-                    break;
+            AnalyzeStatement(statement, state, model, targetNode);
 
-                case ExpressionStatementSyntax exprStmt:
-                    if (exprStmt.Expression is AssignmentExpressionSyntax assign)
-                    {
-                        var targetName = assign.Left.ToString();
-                        state[targetName] = EvaluateExpression(assign.Right, state, model);
-                    }
-                    break;
+            if (reachedTarget)
+                return true;
 
-                case IfStatementSyntax ifStmt:
-                    // Branch analysis: clone states, analyze branches, and join (union)
-                    var trueState = new Dictionary<string, VariableState>(state);
-                    var falseState = new Dictionary<string, VariableState>(state);
-
-                    if (ifStmt.Statement is BlockSyntax trueBlock)
-                        AnalyzeBlock(trueBlock, trueState, model, targetNode);
-                    else
-                        AnalyzeStatement(ifStmt.Statement, trueState, model, targetNode);
-
-                    if (ifStmt.Else != null)
-                    {
-                        if (ifStmt.Else.Statement is BlockSyntax elseBlock)
-                            AnalyzeBlock(elseBlock, falseState, model, targetNode);
-                        else
-                            AnalyzeStatement(ifStmt.Else.Statement, falseState, model, targetNode);
-                    }
-
-                    // Join states (Union of possibilities)
-                    var allKeys = trueState.Keys.Union(falseState.Keys).ToList();
-                    foreach (var key in allKeys)
-                    {
-                        trueState.TryGetValue(key, out var tVal);
-                        falseState.TryGetValue(key, out var fVal);
-
-                        tVal ??= VariableState.Empty;
-                        fVal ??= VariableState.Empty;
-
-                        state[key] = tVal.Union(fVal);
-                    }
-                    break;
-
-                case ReturnStatementSyntax ret when ret.Expression != null:
-                    state["$return"] = EvaluateExpression(ret.Expression, state, model);
-                    break;
-            }
+            // If an unconditional return was hit in this path, stop executing statements in this block
+            if (state.ContainsKey("$terminated"))
+                break;
         }
         return false;
     }
@@ -198,9 +151,67 @@ public class IntraproceduralValueTracker
         SemanticModel model, 
         SyntaxNode? targetNode)
     {
-        if (stmt is ExpressionStatementSyntax expr && expr.Expression is AssignmentExpressionSyntax assign)
+        switch (stmt)
         {
-            state[assign.Left.ToString()] = EvaluateExpression(assign.Right, state, model);
+            case LocalDeclarationStatementSyntax decl:
+                foreach (var variable in decl.Declaration.Variables)
+                {
+                    var varName = variable.Identifier.Text;
+                    state[varName] = variable.Initializer != null 
+                        ? EvaluateExpression(variable.Initializer.Value, state, model) 
+                        : VariableState.Single(new SymbolicValue.Constant(0));
+                }
+                break;
+
+            case ExpressionStatementSyntax exprStmt when exprStmt.Expression is AssignmentExpressionSyntax assign:
+                state[assign.Left.ToString()] = EvaluateExpression(assign.Right, state, model);
+                break;
+
+            case ReturnStatementSyntax ret when ret.Expression != null:
+                var retVal = EvaluateExpression(ret.Expression, state, model);
+                state["$return"] = state["$return"].Union(retVal);
+                state["$terminated"] = VariableState.Empty;
+                break;
+
+            case IfStatementSyntax ifStmt:
+                var trueState = new Dictionary<string, VariableState>(state);
+                var falseState = new Dictionary<string, VariableState>(state);
+
+                if (ifStmt.Statement is BlockSyntax trueBlock)
+                    AnalyzeBlock(trueBlock, trueState, model, targetNode);
+                else
+                    AnalyzeStatement(ifStmt.Statement, trueState, model, targetNode);
+
+                if (ifStmt.Else != null)
+                {
+                    if (ifStmt.Else.Statement is BlockSyntax elseBlock)
+                        AnalyzeBlock(elseBlock, falseState, model, targetNode);
+                    else
+                        AnalyzeStatement(ifStmt.Else.Statement, falseState, model, targetNode);
+                }
+
+                // If one branch terminated with return and the other didn't, clear $terminated on join
+                bool bothTerminated = trueState.ContainsKey("$terminated") && falseState.ContainsKey("$terminated");
+
+                // Merge variables across both branches
+                var allKeys = trueState.Keys.Union(falseState.Keys).Where(k => k != "$terminated").ToList();
+                foreach (var key in allKeys)
+                {
+                    trueState.TryGetValue(key, out var tVal);
+                    falseState.TryGetValue(key, out var fVal);
+
+                    tVal ??= VariableState.Empty;
+                    fVal ??= VariableState.Empty;
+
+                    state[key] = tVal.Union(fVal);
+                }
+
+                if (bothTerminated)
+                    state["$terminated"] = VariableState.Empty;
+                else
+                    state.Remove("$terminated");
+
+                break;
         }
     }
 
@@ -216,9 +227,9 @@ public class IntraproceduralValueTracker
 
             case IdentifierNameSyntax id:
                 var name = id.Identifier.Text;
-                if (env.TryGetValue(name, out var val))
-                    return val;
-                return VariableState.Single(new SymbolicValue.UnknownInput(name, "Unbound identifier"));
+                return env.TryGetValue(name, out var val) 
+                    ? val 
+                    : VariableState.Single(new SymbolicValue.UnknownInput(name, "Unbound identifier"));
 
             case BinaryExpressionSyntax bin:
                 var leftVals = EvaluateExpression(bin.Left, env, model);
@@ -228,11 +239,8 @@ public class IntraproceduralValueTracker
             case InvocationExpressionSyntax inv:
                 return ResolveInvocation(inv, env, model);
 
-            case InterpolatedStringExpressionSyntax:
-                return VariableState.Single(new SymbolicValue.UnknownInput(expr.ToString(), "Formatted string"));
-
             default:
-                return VariableState.Single(new SymbolicValue.UnknownInput(expr.ToString(), "Dynamic Expression"));
+                return VariableState.Single(new SymbolicValue.UnknownInput(expr.ToString(), "Expression"));
         }
     }
 
@@ -247,14 +255,12 @@ public class IntraproceduralValueTracker
             return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Unresolvable invocation"));
         }
 
-        // Trace across project boundaries if source syntax is accessible
         var syntaxRef = methodSymbol.DeclaringSyntaxReferences.FirstOrDefault();
         if (syntaxRef == null || _callStack.Contains(methodSymbol))
         {
-            // Outside codebase or recursive call
             return VariableState.Single(new SymbolicValue.UnknownInput(
                 $"{methodSymbol.ContainingType.Name}.{methodSymbol.Name}()", 
-                syntaxRef == null ? "External Library / Assembly" : "Recursion Boundary"));
+                syntaxRef == null ? "External Library" : "Recursion Boundary"));
         }
 
         if (syntaxRef.GetSyntax() is BaseMethodDeclarationSyntax calleeDeclaration)
@@ -262,23 +268,14 @@ public class IntraproceduralValueTracker
             _callStack.Add(methodSymbol);
             var calleeModel = _compilation.GetSemanticModel(calleeDeclaration.SyntaxTree);
 
-            // Bind argument states to callee parameters
-            var calleeEnv = new Dictionary<string, VariableState>();
-            for (int i = 0; i < inv.ArgumentList.Arguments.Count && i < calleeDeclaration.ParameterList.Parameters.Count; i++)
-            {
-                var argExpr = inv.ArgumentList.Arguments[i].Expression;
-                var paramName = calleeDeclaration.ParameterList.Parameters[i].Identifier.Text;
-                calleeEnv[paramName] = EvaluateExpression(argExpr, env, model);
-            }
-
             var calleeResult = AnalyzeMethod(calleeDeclaration, calleeModel);
             _callStack.Remove(methodSymbol);
 
-            if (calleeResult.TryGetValue("$return", out var retState))
+            if (calleeResult.TryGetValue("$return", out var retState) && retState.PossibleValues.Count > 0)
                 return retState;
         }
 
-        return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Void or unhandled control flow"));
+        return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
     }
 
     private VariableState ComputeBinaryOp(string op, VariableState left, VariableState right)
@@ -289,18 +286,7 @@ public class IntraproceduralValueTracker
         {
             foreach (var r in right.PossibleValues)
             {
-                if (l is SymbolicValue.Constant { Value: long lNum } && r is SymbolicValue.Constant { Value: long rNum })
-                {
-                    results.Add(op switch
-                    {
-                        "+" => new SymbolicValue.Constant(lNum + rNum),
-                        "-" => new SymbolicValue.Constant(lNum - rNum),
-                        "*" => new SymbolicValue.Constant(lNum * rNum),
-                        "/" when rNum != 0 => new SymbolicValue.Constant(lNum / rNum),
-                        _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
-                    });
-                }
-                else if (l is SymbolicValue.Constant { Value: int lInt } && r is SymbolicValue.Constant { Value: int rInt })
+                if (l is SymbolicValue.Constant { Value: int lInt } && r is SymbolicValue.Constant { Value: int rInt })
                 {
                     results.Add(op switch
                     {
@@ -311,13 +297,8 @@ public class IntraproceduralValueTracker
                         _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
                     });
                 }
-                else if (l is SymbolicValue.Constant { Value: string lStr } && r is SymbolicValue.Constant { Value: string rStr } && op == "+")
-                {
-                    results.Add(new SymbolicValue.Constant(lStr + rStr));
-                }
                 else
                 {
-                    // Propagate symbolic placeholder expression
                     results.Add(new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r)));
                 }
             }
@@ -325,19 +306,11 @@ public class IntraproceduralValueTracker
 
         return new VariableState { PossibleValues = results.ToImmutable() };
     }
-
-    private static object? GetDefaultValue(TypeSyntax type, SemanticModel model)
-    {
-        var typeInfo = model.GetTypeInfo(type);
-        if (typeInfo.Type == null) return null;
-        if (typeInfo.Type.IsReferenceType) return null;
-        return 0;
-    }
 }
 
 #endregion
 
-#region Verification Driver
+#region Driver
 
 public static class Program
 {
@@ -362,7 +335,7 @@ public static class Program
                 }
 
                 int finalRate = discountPercent + 5;
-                return finalRate; // Line 21: Query finalRate here
+                return finalRate; // Line 21
             }
 
             private int ComputeBaseRate(int tier)
@@ -382,23 +355,13 @@ public static class Program
 
         var analyzer = new IntraproceduralValueTracker(compilation);
 
-        Console.WriteLine("Analyzing variable 'finalRate' at line 21...\n");
-        var possibleValues = analyzer.EvaluateVariableAt(syntaxTree, "finalRate", 21);
+        Console.WriteLine("discountPercent at line 20:");
+        var discountValues = analyzer.EvaluateVariableAt(syntaxTree, "discountPercent", 20);
+        Console.WriteLine($" -> {discountValues}");
 
-        Console.WriteLine("=== Possible Values Discovered ===");
-        foreach (var val in possibleValues.PossibleValues)
-        {
-            Console.WriteLine($" -> {val}");
-        }
-
-        Console.WriteLine("\nAnalyzing variable 'discountPercent' at line 20...\n");
-        var intermediateValues = analyzer.EvaluateVariableAt(syntaxTree, "discountPercent", 20);
-
-        Console.WriteLine("=== Possible Values Discovered ===");
-        foreach (var val in intermediateValues.PossibleValues)
-        {
-            Console.WriteLine($" -> {val}");
-        }
+        Console.WriteLine("\nfinalRate at line 21:");
+        var finalRateValues = analyzer.EvaluateVariableAt(syntaxTree, "finalRate", 21);
+        Console.WriteLine($" -> {finalRateValues}");
     }
 }
 
