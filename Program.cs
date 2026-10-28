@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using Microsoft.CodeAnalysis;
@@ -96,7 +97,7 @@ public class FolderValueTracker
         }
     }
 
-    #region Static Permutations
+    #region Static Class Initialization & Permutations
 
     private record StaticClassInitializer(
         INamedTypeSymbol TypeSymbol,
@@ -184,7 +185,8 @@ public class FolderValueTracker
                         variable.Initializer.Value, 
                         new Dictionary<string, VariableState>(), 
                         fieldModel, 
-                        currentHeap
+                        currentHeap,
+                        unit.TypeSymbol
                     );
                 }
                 else
@@ -429,10 +431,35 @@ public class FolderValueTracker
         Dictionary<string, VariableState> staticScope,
         INamedTypeSymbol? enclosingType = null)
     {
+        // 0. Roslyn Constant Folding Fast-Path (const string, const int, nameof(), etc.)
+        var constantOpt = model.GetConstantValue(expr);
+        if (constantOpt.HasValue && constantOpt.Value != null)
+        {
+            return VariableState.Single(new SymbolicValue.Constant(constantOpt.Value));
+        }
+
         switch (expr)
         {
             case LiteralExpressionSyntax lit:
                 return VariableState.Single(new SymbolicValue.Constant(lit.Token.Value));
+
+            case ParenthesizedExpressionSyntax paren:
+                return EvaluateExpression(paren.Expression, env, model, staticScope, enclosingType);
+
+            case ConditionalExpressionSyntax cond:
+                var condVals = EvaluateExpression(cond.Condition, env, model, staticScope, enclosingType);
+                var whenTrue = EvaluateExpression(cond.WhenTrue, env, model, staticScope, enclosingType);
+                var whenFalse = EvaluateExpression(cond.WhenFalse, env, model, staticScope, enclosingType);
+
+                bool hasTrue = condVals.PossibleValues.Any(v => v is SymbolicValue.Constant { Value: true });
+                bool hasFalse = condVals.PossibleValues.Any(v => v is SymbolicValue.Constant { Value: false });
+
+                if (hasTrue && !hasFalse) return whenTrue;
+                if (!hasTrue && hasFalse) return whenFalse;
+                return whenTrue.Union(whenFalse);
+
+            case CastExpressionSyntax cast:
+                return EvaluateExpression(cast.Expression, env, model, staticScope, enclosingType);
 
             case IdentifierNameSyntax id:
                 var name = id.Identifier.Text;
@@ -445,6 +472,10 @@ public class FolderValueTracker
                     string key = $"{field.ContainingType.ToDisplayString()}.{field.Name}";
                     if (staticScope.TryGetValue(key, out var staticVal)) return staticVal;
                     if (_staticHeap.TryGetValue(key, out var heapVal)) return heapVal;
+                }
+                if (symbol is ILocalSymbol localSym && localSym.HasConstantValue)
+                {
+                    return VariableState.Single(new SymbolicValue.Constant(localSym.ConstantValue));
                 }
 
                 return VariableState.Single(new SymbolicValue.UnknownInput(name, "Unbound identifier"));
@@ -472,9 +503,17 @@ public class FolderValueTracker
                 return ComputeBinaryOp(bin.OperatorToken.Text, leftVals, rightVals);
 
             case InvocationExpressionSyntax inv:
+                var invokedSymbol = model.GetSymbolInfo(inv).Symbol as IMethodSymbol;
+                if (invokedSymbol != null && 
+                    invokedSymbol.ContainingType.SpecialType == SpecialType.System_String && 
+                    invokedSymbol.Name == "Format" &&
+                    inv.ArgumentList.Arguments.Count >= 2)
+                {
+                    return EvaluateStringFormatInvocation(inv, env, model, staticScope, enclosingType);
+                }
+
                 return ResolveInvocation(inv, env, model, staticScope);
 
-            // Interpolated String Handling: $"User_{id}: {status}"
             case InterpolatedStringExpressionSyntax interpolated:
                 return EvaluateInterpolatedString(interpolated, env, model, staticScope, enclosingType);
 
@@ -483,9 +522,6 @@ public class FolderValueTracker
         }
     }
 
-    /// <summary>
-    /// Evaluates string interpolation via the Cartesian product of literal content and hole evaluations.
-    /// </summary>
     private VariableState EvaluateInterpolatedString(
         InterpolatedStringExpressionSyntax interpolated,
         Dictionary<string, VariableState> env,
@@ -493,88 +529,161 @@ public class FolderValueTracker
         Dictionary<string, VariableState> staticScope,
         INamedTypeSymbol? enclosingType)
     {
-        // Each part of the interpolation produces a list of possible string fragments
-        var partsPossibilities = new List<List<(string Text, bool IsSymbolic)>>();
+        var slicesPossibilities = new List<List<(string Rendered, bool IsSymbolic)>>();
 
         foreach (var content in interpolated.Contents)
         {
-            if (content is InterpolatedStringTextSyntax textSyntax)
+            switch (content)
             {
-                // Raw string literal text segment
-                partsPossibilities.Add(new List<(string, bool)> { (textSyntax.TextToken.ValueText, false) });
-            }
-            else if (content is InterpolationSyntax hole)
-            {
-                var holeValues = EvaluateExpression(hole.Expression, env, model, staticScope, enclosingType);
-                var holeOptions = new List<(string Text, bool IsSymbolic)>();
+                case InterpolatedStringTextSyntax textSyntax:
+                    slicesPossibilities.Add(new List<(string, bool)> 
+                    { 
+                        (textSyntax.TextToken.ValueText, false) 
+                    });
+                    break;
 
-                string? formatString = hole.FormatClause?.FormatStringToken.ValueText;
-                int? alignment = null;
-                if (hole.AlignmentClause?.Value is LiteralExpressionSyntax { Token.Value: int alignVal })
-                {
-                    alignment = alignVal;
-                }
+                case InterpolationSyntax hole:
+                    var holeValues = EvaluateExpression(hole.Expression, env, model, staticScope, enclosingType);
+                    var holeOptions = new List<(string Rendered, bool IsSymbolic)>();
 
-                foreach (var val in holeValues.PossibleValues)
-                {
-                    if (val is SymbolicValue.Constant { Value: not null } c)
+                    string? formatString = hole.FormatClause?.FormatStringToken.ValueText;
+                    int? alignment = null;
+                    if (hole.AlignmentClause?.Value is LiteralExpressionSyntax { Token.Value: int alignVal })
                     {
-                        string formatted;
-                        if (!string.IsNullOrEmpty(formatString))
+                        alignment = alignVal;
+                    }
+
+                    foreach (var val in holeValues.PossibleValues)
+                    {
+                        if (val is SymbolicValue.Constant c && c.Value != null)
                         {
-                            formatted = string.Format($"{{0:{formatString}}}", c.Value);
+                            try
+                            {
+                                string formatted;
+                                if (!string.IsNullOrEmpty(formatString))
+                                {
+                                    formatted = string.Format(CultureInfo.InvariantCulture, $"{{0:{formatString}}}", c.Value);
+                                }
+                                else
+                                {
+                                    formatted = c.Value.ToString() ?? "";
+                                }
+
+                                if (alignment.HasValue)
+                                {
+                                    formatted = string.Format(CultureInfo.InvariantCulture, $"{{0,{alignment.Value}}}", formatted);
+                                }
+
+                                holeOptions.Add((formatted, false));
+                            }
+                            catch
+                            {
+                                holeOptions.Add((c.Value.ToString() ?? "", false));
+                            }
                         }
                         else
                         {
-                            formatted = c.Value.ToString() ?? "";
-                        }
+                            string repr = val.ToString() ?? "?";
+                            if (!string.IsNullOrEmpty(formatString))
+                                repr = $"{{{repr}:{formatString}}}";
+                            else
+                                repr = $"{{{repr}}}";
 
-                        if (alignment.HasValue)
-                        {
-                            formatted = string.Format($"{{0,{alignment.Value}}}", formatted);
+                            holeOptions.Add((repr, true));
                         }
-
-                        holeOptions.Add((formatted, false));
                     }
-                    else
+
+                    if (holeOptions.Count == 0)
                     {
-                        // Wrap non-constant expressions/placeholders as symbolic tags inside the interpolated string
-                        string holeStr = val.ToString() ?? "?";
-                        if (!string.IsNullOrEmpty(formatString))
-                            holeStr = $"{{{holeStr}:{formatString}}}";
-                        else
-                            holeStr = $"{{{holeStr}}}";
-
-                        holeOptions.Add((holeStr, true));
+                        holeOptions.Add(("{<?>}", true));
                     }
-                }
 
-                if (holeOptions.Count == 0)
-                {
-                    holeOptions.Add(("{?}", true));
-                }
-
-                partsPossibilities.Add(holeOptions);
+                    slicesPossibilities.Add(holeOptions);
+                    break;
             }
         }
 
-        // Compute Cartesian Product across all segments
-        var combinations = CartesianProduct(partsPossibilities);
+        var combinations = CartesianProduct(slicesPossibilities);
         var results = ImmutableHashSet.CreateBuilder<SymbolicValue>();
 
         foreach (var combination in combinations)
         {
             bool hasAnySymbolic = combination.Any(c => c.IsSymbolic);
-            string fullString = string.Concat(combination.Select(c => c.Text));
+            string fullString = string.Concat(combination.Select(c => c.Rendered));
 
             if (hasAnySymbolic)
             {
-                // String contains unresolved hole(s); keep as a parameterized symbolic input
                 results.Add(new SymbolicValue.UnknownInput($"$\"{fullString}\"", "Interpolated Template"));
             }
             else
             {
                 results.Add(new SymbolicValue.Constant(fullString));
+            }
+        }
+
+        return new VariableState { PossibleValues = results.ToImmutable() };
+    }
+
+    private VariableState EvaluateStringFormatInvocation(
+        InvocationExpressionSyntax inv,
+        Dictionary<string, VariableState> env,
+        SemanticModel model,
+        Dictionary<string, VariableState> staticScope,
+        INamedTypeSymbol? enclosingType)
+    {
+        var args = inv.ArgumentList.Arguments;
+        int formatIndex = 0;
+
+        var firstArgType = model.GetTypeInfo(args[0].Expression).Type;
+        if (firstArgType != null && firstArgType.AllInterfaces.Any(i => i.Name == "IFormatProvider"))
+        {
+            formatIndex = 1;
+        }
+
+        if (args.Count <= formatIndex)
+            return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Invalid string.Format invocation"));
+
+        var formatPatternValues = EvaluateExpression(args[formatIndex].Expression, env, model, staticScope, enclosingType);
+
+        var argValuesList = new List<VariableState>();
+        for (int i = formatIndex + 1; i < args.Count; i++)
+        {
+            argValuesList.Add(EvaluateExpression(args[i].Expression, env, model, staticScope, enclosingType));
+        }
+
+        var results = ImmutableHashSet.CreateBuilder<SymbolicValue>();
+
+        foreach (var patternVal in formatPatternValues.PossibleValues)
+        {
+            if (patternVal is SymbolicValue.Constant { Value: string formatPattern })
+            {
+                var argPermutations = CartesianProduct(argValuesList.Select(a => a.PossibleValues.ToList()).ToList());
+
+                foreach (var argPerm in argPermutations)
+                {
+                    bool allConstants = argPerm.All(p => p is SymbolicValue.Constant);
+                    if (allConstants)
+                    {
+                        var rawArgs = argPerm.Select(p => ((SymbolicValue.Constant)p).Value).ToArray();
+                        try
+                        {
+                            string formatted = string.Format(CultureInfo.InvariantCulture, formatPattern, rawArgs);
+                            results.Add(new SymbolicValue.Constant(formatted));
+                        }
+                        catch
+                        {
+                            results.Add(new SymbolicValue.UnknownInput($"string.Format(\"{formatPattern}\")", "Format error"));
+                        }
+                    }
+                    else
+                    {
+                        results.Add(new SymbolicValue.UnknownInput($"string.Format(\"{formatPattern}\", {string.Join(", ", argPerm)})", "Parameterized Format"));
+                    }
+                }
+            }
+            else
+            {
+                results.Add(new SymbolicValue.UnknownInput(inv.ToString(), "Dynamic format string"));
             }
         }
 
@@ -723,7 +832,6 @@ public class FolderValueTracker
         {
             foreach (var r in right.PossibleValues)
             {
-                // Integer arithmetic
                 if (l is SymbolicValue.Constant { Value: int lInt } && r is SymbolicValue.Constant { Value: int rInt })
                 {
                     results.Add(op switch
@@ -735,7 +843,6 @@ public class FolderValueTracker
                         _ => new SymbolicValue.SymbolicExpression(op, ImmutableList.Create(l, r))
                     });
                 }
-                // String concatenation and coercion
                 else if (op == "+" && (l is SymbolicValue.Constant { Value: string } || r is SymbolicValue.Constant { Value: string }))
                 {
                     if (l is SymbolicValue.Constant lc && r is SymbolicValue.Constant rc)
