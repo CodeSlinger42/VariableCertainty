@@ -24,9 +24,12 @@ public abstract record SymbolicValue
         public override string ToString() => Min == Max ? $"{Min}" : $"[{Min} .. {Max}]";
     }
 
-    public sealed record UnknownInput(string OriginName, string Reason) : SymbolicValue
+    /// <summary>
+    /// Dead-end input anchor formatted strictly as <file:line#:varname>
+    /// </summary>
+    public sealed record SourceAnchor(string FileName, int LineNumber, string VarName) : SymbolicValue
     {
-        public override string ToString() => $"<ExternalInput: {OriginName} ({Reason})>";
+        public override string ToString() => $"<{FileName}:{LineNumber}:{VarName}>";
     }
 
     public sealed record SymbolicExpression(string Op, ImmutableList<SymbolicValue> Operands) : SymbolicValue
@@ -41,7 +44,6 @@ public abstract record SymbolicValue
         }
     }
 
-    // Factored choice-set representing {v1, v2, ...} at a single branch/call point
     public sealed record ChoiceSet(ImmutableSortedSet<string> Representations) : SymbolicValue
     {
         public static ChoiceSet FromValues(IEnumerable<SymbolicValue> values)
@@ -73,7 +75,7 @@ public abstract record SymbolicValue
 
 public record VariableState
 {
-    public ImmutableHashSet<SymbolicValue> PossibleValues { get; init; } = ImmutableHashSet<SymbolicValue>.Empty;
+    public ImmutableHashSet<SymbolicValue> PossibleValues { get; init } = ImmutableHashSet<SymbolicValue>.Empty;
 
     public static VariableState Empty => new();
 
@@ -83,22 +85,17 @@ public record VariableState
     public VariableState Union(VariableState other) => 
         new() { PossibleValues = PossibleValues.Union(other.PossibleValues) };
 
-    /// <summary>
-    /// Compact output renderer: collapses multiple choices into a factored ChoiceSet representation.
-    /// </summary>
     public string ToFactoredString()
     {
         if (PossibleValues.Count == 0) return "∅ (Unassigned)";
         if (PossibleValues.Count == 1) return PossibleValues.First().ToString()!;
 
-        // Check if all values are constants
         bool allConstants = PossibleValues.All(v => v is SymbolicValue.Constant);
         if (allConstants)
         {
             return $"{{{string.Join(", ", PossibleValues.Select(v => v.ToString()).OrderBy(s => s))}}}";
         }
 
-        // Collapse into factored representation
         var choice = SymbolicValue.ChoiceSet.FromValues(PossibleValues);
         return choice.ToString();
     }
@@ -155,6 +152,15 @@ public class FolderValueTracker
             foreach (var subNested in GetNestedTypes(nested))
                 yield return subNested;
         }
+    }
+
+    public static SymbolicValue.SourceAnchor CreateAnchor(SyntaxNode node, string varName)
+    {
+        var lineSpan = node.SyntaxTree.GetLineSpan(node.Span);
+        string fileName = Path.GetFileName(lineSpan.Path);
+        if (string.IsNullOrEmpty(fileName)) fileName = "source";
+        int line = lineSpan.StartLinePosition.Line + 1;
+        return new SymbolicValue.SourceAnchor(fileName, line, varName);
     }
 
     #region Static Class Initialization & Permutations
@@ -316,7 +322,10 @@ public class FolderValueTracker
         var text = tree.GetText();
 
         if (lineNumber < 1 || lineNumber > text.Lines.Count)
-            return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Line out of range"));
+        {
+            string fName = Path.GetFileName(tree.FilePath);
+            return VariableState.Single(new SymbolicValue.SourceAnchor(fName, lineNumber, variableName));
+        }
 
         var targetStatement = root.DescendantNodes()
             .OfType<StatementSyntax>()
@@ -325,11 +334,16 @@ public class FolderValueTracker
             .FirstOrDefault();
 
         if (targetStatement == null)
-            return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Statement not found"));
+        {
+            string fName = Path.GetFileName(tree.FilePath);
+            return VariableState.Single(new SymbolicValue.SourceAnchor(fName, lineNumber, variableName));
+        }
 
         var containingMethod = targetStatement.AncestorsAndSelf().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
         if (containingMethod == null)
-            return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Outside method scope"));
+        {
+            return VariableState.Single(CreateAnchor(targetStatement, variableName));
+        }
 
         var containingType = containingMethod.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
         INamedTypeSymbol? currentTypeSymbol = containingType != null 
@@ -374,7 +388,7 @@ public class FolderValueTracker
                 : state;
         }
 
-        return VariableState.Single(new SymbolicValue.UnknownInput(variableName, "Unresolved / out of scope"));
+        return VariableState.Single(CreateAnchor(targetStatement, variableName));
     }
 
     private Dictionary<string, VariableState> AnalyzeMethod(
@@ -401,7 +415,7 @@ public class FolderValueTracker
                 }
                 else
                 {
-                    state[paramName] = VariableState.Single(new SymbolicValue.UnknownInput(paramName, "Method Parameter"));
+                    state[paramName] = VariableState.Single(CreateAnchor(param, paramName));
                 }
             }
         }
@@ -590,7 +604,7 @@ public class FolderValueTracker
                     return VariableState.Single(new SymbolicValue.StringBuilderInstance(instanceId));
                 }
 
-                return VariableState.Single(new SymbolicValue.UnknownInput(objCreation.Type.ToString(), "New Object Instance"));
+                return VariableState.Single(CreateAnchor(objCreation, objCreation.Type.ToString()));
 
             case IdentifierNameSyntax id:
                 var name = id.Identifier.Text;
@@ -609,7 +623,7 @@ public class FolderValueTracker
                     return VariableState.Single(new SymbolicValue.Constant(localSym.ConstantValue));
                 }
 
-                return VariableState.Single(new SymbolicValue.UnknownInput(name, "Unbound identifier"));
+                return VariableState.Single(CreateAnchor(id, name));
 
             case MemberAccessExpressionSyntax memberAccess:
                 var memberSymbol = model.GetSymbolInfo(memberAccess).Symbol;
@@ -626,7 +640,7 @@ public class FolderValueTracker
                     if (_staticHeap.TryGetValue(key, out var heapVal)) return heapVal;
                 }
 
-                return VariableState.Single(new SymbolicValue.UnknownInput(memberAccess.ToString(), "External/Unresolved Member"));
+                return VariableState.Single(CreateAnchor(memberAccess, memberAccess.Name.Identifier.Text));
 
             case BinaryExpressionSyntax bin:
                 var leftVals = EvaluateExpression(bin.Left, env, model, staticScope, enclosingType);
@@ -659,7 +673,7 @@ public class FolderValueTracker
                 return EvaluateInterpolatedString(interpolated, env, model, staticScope, enclosingType);
 
             default:
-                return VariableState.Single(new SymbolicValue.UnknownInput(expr.ToString(), "Expression"));
+                return VariableState.Single(CreateAnchor(expr, expr.ToString()));
         }
     }
 
@@ -735,7 +749,7 @@ public class FolderValueTracker
                         {
                             env[bufKey] = VariableState.Single(new SymbolicValue.SymbolicExpression("Insert", ImmutableList.Create<SymbolicValue>(
                                 new SymbolicValue.Constant(inst.InstanceId),
-                                new SymbolicValue.UnknownInput(inv.ToString(), "Arbitrary Index Insert")
+                                CreateAnchor(inv, "Insert")
                             )));
                         }
                     }
@@ -822,9 +836,8 @@ public class FolderValueTracker
             return VariableState.Single(new SymbolicValue.Constant(string.Concat(factoredParts.Select(p => ((SymbolicValue.Constant)p).Value))));
         }
 
-        // Return factored template representation
-        string template = string.Concat(factoredParts.Select(p => p is SymbolicValue.Constant c ? c.Value?.ToString() : $"{{{p}}}"));
-        return VariableState.Single(new SymbolicValue.UnknownInput($"$\"{template}\"", "Interpolated Template"));
+        string template = string.Concat(factoredParts.Select(p => p is SymbolicValue.Constant c ? c.Value?.ToString() : $"{p}"));
+        return VariableState.Single(new SymbolicValue.Constant(template));
     }
 
     private VariableState EvaluateStringFormatInvocation(
@@ -844,7 +857,7 @@ public class FolderValueTracker
         }
 
         if (args.Count <= formatIndex)
-            return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Invalid string.Format invocation"));
+            return VariableState.Single(CreateAnchor(inv, "string.Format"));
 
         var formatPatternValues = EvaluateExpression(args[formatIndex].Expression, env, model, staticScope, enclosingType);
         var argValuesList = new List<VariableState>();
@@ -866,14 +879,13 @@ public class FolderValueTracker
                 }
                 else
                 {
-                    // Factor arguments into ChoiceSets rather than producing Cartesian products
                     var factoredArgs = argValuesList.Select(a => SymbolicValue.ChoiceSet.FromValues(a.PossibleValues));
-                    results.Add(new SymbolicValue.UnknownInput($"string.Format(\"{formatPattern}\", {string.Join(", ", factoredArgs)})", "Factored Format"));
+                    results.Add(new SymbolicValue.Constant(string.Format(CultureInfo.InvariantCulture, formatPattern, factoredArgs.Cast<object>().ToArray())));
                 }
             }
             else
             {
-                results.Add(new SymbolicValue.UnknownInput(inv.ToString(), "Dynamic format string"));
+                results.Add(CreateAnchor(inv, "string.Format"));
             }
         }
 
@@ -897,15 +909,13 @@ public class FolderValueTracker
         }
 
         if (targetMethod == null)
-            return VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "Unresolvable invocation"));
+            return VariableState.Single(CreateAnchor(inv, inv.Expression.ToString() + "()"));
 
         var candidates = ResolveImplementationCandidates(targetMethod);
 
         if (candidates.Count == 0)
         {
-            return VariableState.Single(new SymbolicValue.UnknownInput(
-                $"{targetMethod.ContainingType?.Name}.{targetMethod.Name}()", 
-                "External or Abstract with no source implementations"));
+            return VariableState.Single(CreateAnchor(inv, $"{targetMethod.Name}()"));
         }
 
         var aggregatedResult = VariableState.Empty;
@@ -917,19 +927,13 @@ public class FolderValueTracker
 
             if (_callStack.Contains(methodSignatureKey) || _callStack.Count >= MaxCallDepth)
             {
-                var fallback = new SymbolicValue.UnknownInput(
-                    $"{candidate.ContainingType.Name}.{candidate.Name}()", 
-                    "Recursion Boundary");
-                aggregatedResult = aggregatedResult.Union(VariableState.Single(fallback));
+                aggregatedResult = aggregatedResult.Union(VariableState.Single(CreateAnchor(inv, $"{candidate.Name}()")));
                 continue;
             }
 
             if (syntaxRef == null)
             {
-                var fallback = new SymbolicValue.UnknownInput(
-                    $"{candidate.ContainingType.Name}.{candidate.Name}()", 
-                    "External Library");
-                aggregatedResult = aggregatedResult.Union(VariableState.Single(fallback));
+                aggregatedResult = aggregatedResult.Union(VariableState.Single(CreateAnchor(inv, $"{candidate.ContainingType.Name}.{candidate.Name}()")));
                 continue;
             }
 
@@ -962,7 +966,7 @@ public class FolderValueTracker
 
         return aggregatedResult.PossibleValues.Count > 0 
             ? aggregatedResult 
-            : VariableState.Single(new SymbolicValue.UnknownInput(inv.ToString(), "No return value captured"));
+            : VariableState.Single(CreateAnchor(inv, $"{targetMethod.Name}()"));
     }
 
     private IMethodSymbol? FindPrivateMethodInEnclosingType(InvocationExpressionSyntax inv, INamedTypeSymbol enclosingType)
@@ -1092,16 +1096,11 @@ public class FolderValueTracker
         }
     }
 
-    /// <summary>
-    /// Computes binary operation, factoring multi-valued options into ChoiceSet disjunctions
-    /// rather than multiplying out full repetitive symbolic chains.
-    /// </summary>
     private VariableState ComputeBinaryOp(string op, VariableState left, VariableState right)
     {
         bool leftHasMultiple = left.PossibleValues.Count > 1;
         bool rightHasMultiple = right.PossibleValues.Count > 1;
 
-        // If both sides are small discrete integer sets, compute constant foldings directly
         bool allConstants = left.PossibleValues.All(l => l is SymbolicValue.Constant) &&
                             right.PossibleValues.All(r => r is SymbolicValue.Constant);
 
@@ -1133,7 +1132,6 @@ public class FolderValueTracker
                 return new VariableState { PossibleValues = folded.ToImmutable() };
         }
 
-        // Factor common side: if one side has multiple choices, wrap as a single ChoiceSet operand
         SymbolicValue leftOperand = leftHasMultiple 
             ? SymbolicValue.ChoiceSet.FromValues(left.PossibleValues) 
             : left.PossibleValues.FirstOrDefault() ?? new SymbolicValue.Constant(0);
@@ -1232,7 +1230,7 @@ public static class Program
         }
 
         // MODE 2: Comprehensive Batch Scan
-        Console.WriteLine("\n=== Compact Factored Variable Scan ===");
+        Console.WriteLine("\n=== Compact Anchored Variable Scan ===");
         foreach (var tree in syntaxTrees)
         {
             var root = tree.GetCompilationUnitRoot();
